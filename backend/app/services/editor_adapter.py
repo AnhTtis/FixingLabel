@@ -8,6 +8,7 @@ from app.services.coord_transform import PageGeometry, image_to_pdf_bbox, pdf_to
 
 MIN_DRAW_PIXELS = 8.0
 LABEL_COLOR_FALLBACK = "#6b7280"
+CANVAS_VERSION = "4.4.0"
 
 
 def current_page(annotation: AnnotationDocument, page_number: int):
@@ -86,6 +87,116 @@ def build_canvas_boxes(page: Any, geometry: PageGeometry, labels_payload: dict |
             }
         )
     return boxes
+
+
+
+def rgba_from_hex(value: str, alpha: float) -> str:
+    color = value.lstrip("#")
+    if len(color) != 6:
+        return f"rgba(107,114,128,{alpha})"
+    red = int(color[0:2], 16)
+    green = int(color[2:4], 16)
+    blue = int(color[4:6], 16)
+    return f"rgba({red},{green},{blue},{alpha})"
+
+
+
+def build_canvas_initial_drawing(boxes: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "version": CANVAS_VERSION,
+        "objects": [
+            {
+                "type": "rect",
+                "left": float(box["left"]),
+                "top": float(box["top"]),
+                "width": float(box["width"]),
+                "height": float(box["height"]),
+                "scaleX": 1.0,
+                "scaleY": 1.0,
+                "fill": rgba_from_hex(str(box.get("color", LABEL_COLOR_FALLBACK)), 0.08),
+                "stroke": str(box.get("color", LABEL_COLOR_FALLBACK)),
+                "strokeWidth": 2,
+                "lockRotation": True,
+                "hasRotatingPoint": False,
+                "cornerColor": str(box.get("color", LABEL_COLOR_FALLBACK)),
+                "transparentCorners": False,
+                "rx": 4,
+                "ry": 4,
+                "elementId": str(box.get("id", "")),
+                "labelId": str(box.get("label", "")),
+                "name": str(box.get("id", "")),
+            }
+            for box in boxes
+        ],
+    }
+
+
+
+def canvas_json_to_payload(
+    canvas_json: dict[str, Any] | None,
+    existing_boxes: list[dict[str, Any]],
+    new_box_label: str,
+) -> list[dict[str, Any]]:
+    objects = (canvas_json or {}).get("objects", [])
+    payload: list[dict[str, Any]] = []
+    existing_by_id = {str(box["id"]): box for box in existing_boxes if box.get("id")}
+    seen_existing_ids: set[str] = set()
+
+    for obj in objects:
+        if obj.get("type") != "rect":
+            continue
+
+        width = max(1.0, float(obj.get("width", 0.0)) * float(obj.get("scaleX", 1.0)))
+        height = max(1.0, float(obj.get("height", 0.0)) * float(obj.get("scaleY", 1.0)))
+        left = round(float(obj.get("left", 0.0)), 2)
+        top = round(float(obj.get("top", 0.0)), 2)
+        element_id = str(obj.get("elementId") or obj.get("name") or "")
+        label_id = str(obj.get("labelId") or obj.get("label") or "")
+
+        if element_id and element_id in existing_by_id:
+            existing = existing_by_id[element_id]
+            seen_existing_ids.add(element_id)
+            payload.append(
+                {
+                    "id": element_id,
+                    "label": str(existing.get("label") or label_id or new_box_label),
+                    "left": left,
+                    "top": top,
+                    "width": round(width, 2),
+                    "height": round(height, 2),
+                }
+            )
+            continue
+
+        if not element_id and not label_id:
+            existing = next((box for box in existing_boxes if str(box.get("id") or "") not in seen_existing_ids), None)
+            if existing is not None:
+                existing_id = str(existing["id"])
+                seen_existing_ids.add(existing_id)
+                payload.append(
+                    {
+                        "id": existing_id,
+                        "label": str(existing["label"]),
+                        "left": left,
+                        "top": top,
+                        "width": round(width, 2),
+                        "height": round(height, 2),
+                    }
+                )
+                continue
+
+        payload.append(
+            {
+                "id": "",
+                "label": label_id or new_box_label,
+                "left": left,
+                "top": top,
+                "width": round(width, 2),
+                "height": round(height, 2),
+            }
+        )
+
+    return payload
 
 
 

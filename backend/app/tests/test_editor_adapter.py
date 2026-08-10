@@ -1,6 +1,11 @@
 from app.schemas.annotation import AnnotationElement, AnnotationPage
 from app.services.coord_transform import PageGeometry
-from app.services.editor_adapter import build_canvas_boxes, canvas_payload_to_patch_operations
+from app.services.editor_adapter import (
+    build_canvas_boxes,
+    build_canvas_initial_drawing,
+    canvas_json_to_payload,
+    canvas_payload_to_patch_operations,
+)
 
 
 def test_build_canvas_boxes_uses_label_metadata() -> None:
@@ -24,6 +29,78 @@ def test_build_canvas_boxes_uses_label_metadata() -> None:
     assert boxes[0]["label_name"] == "Title"
     assert boxes[0]["left"] == 40.0
     assert boxes[0]["width"] == 160.0
+
+
+
+def test_build_canvas_initial_drawing_preserves_box_metadata() -> None:
+    boxes = [
+        {
+            "id": "e1",
+            "label": "title",
+            "color": "#2563eb",
+            "left": 40.0,
+            "top": 20.0,
+            "width": 160.0,
+            "height": 80.0,
+        }
+    ]
+
+    drawing = build_canvas_initial_drawing(boxes)
+
+    assert drawing["version"] == "4.4.0"
+    assert drawing["objects"][0]["elementId"] == "e1"
+    assert drawing["objects"][0]["labelId"] == "title"
+    assert drawing["objects"][0]["name"] == "e1"
+
+
+
+def test_canvas_json_to_payload_prefers_embedded_ids_over_object_order() -> None:
+    existing_boxes = [
+        {"id": "e1", "label": "title", "left": 40.0, "top": 20.0, "width": 160.0, "height": 80.0},
+        {"id": "e2", "label": "figure", "left": 200.0, "top": 40.0, "width": 80.0, "height": 60.0},
+    ]
+    canvas_json = {
+        "objects": [
+            {
+                "type": "rect",
+                "elementId": "e2",
+                "labelId": "figure",
+                "left": 210.0,
+                "top": 50.0,
+                "width": 80.0,
+                "height": 60.0,
+                "scaleX": 1.0,
+                "scaleY": 1.0,
+            },
+            {
+                "type": "rect",
+                "elementId": "e1",
+                "labelId": "title",
+                "left": 50.0,
+                "top": 30.0,
+                "width": 160.0,
+                "height": 80.0,
+                "scaleX": 1.0,
+                "scaleY": 1.0,
+            },
+            {
+                "type": "rect",
+                "left": 300.0,
+                "top": 60.0,
+                "width": 40.0,
+                "height": 30.0,
+                "scaleX": 1.0,
+                "scaleY": 1.0,
+            },
+        ]
+    }
+
+    payload = canvas_json_to_payload(canvas_json, existing_boxes, "table")
+
+    assert payload[0]["id"] == "e2"
+    assert payload[1]["id"] == "e1"
+    assert payload[2]["id"] == ""
+    assert payload[2]["label"] == "table"
 
 
 
