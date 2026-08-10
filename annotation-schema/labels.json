@@ -1,0 +1,14 @@
+{
+  "labels": [
+    { "id": "title", "name": "Title", "color": "#2563eb", "shortcut": "1" },
+    { "id": "author", "name": "Author", "color": "#9333ea", "shortcut": "2" },
+    { "id": "abstract", "name": "Abstract", "color": "#16a34a", "shortcut": "3" },
+    { "id": "sec_1", "name": "Section 1", "color": "#dc2626", "shortcut": "4" },
+    { "id": "sec_2", "name": "Section 2", "color": "#f97316", "shortcut": "5" },
+    { "id": "para", "name": "Paragraph", "color": "#111827", "shortcut": "P" },
+    { "id": "figure", "name": "Figure", "color": "#0891b2", "shortcut": "F" },
+    { "id": "table", "name": "Table", "color": "#c026d3", "shortcut": "T" },
+    { "id": "list", "name": "List", "color": "#a16207", "shortcut": "L" },
+    { "id": "equation", "name": "Equation", "color": "#65a30d", "shortcut": "E" }
+  ]
+}

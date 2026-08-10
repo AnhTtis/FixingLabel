@@ -1,0 +1,26 @@
+[project]
+name = "fixinglabel-backend"
+version = "0.1.0"
+description = "Python tools for PDF bbox and label correction, with a Streamlit editor"
+requires-python = ">=3.11"
+dependencies = [
+  "pymupdf>=1.26.0",
+  "pydantic>=2.11.0",
+  "streamlit>=1.60.0",
+  "streamlit-drawable-canvas>=0.9.3",
+  "pandas>=2.2.0",
+  "pillow>=11.3.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4.0"
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["app/tests"]
