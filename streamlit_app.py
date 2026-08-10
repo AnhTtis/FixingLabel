@@ -294,58 +294,12 @@ def handle_viewer_events(viewer_result: dict[str, object], page_width: float, pa
 
 
 
-def render_bbox_list_panel() -> None:
-    st.subheader("Danh sách bbox trang hiện tại")
-    elements = list(enumerate(get_page_elements(st.session_state.current_page)))
-
-    if not elements:
-        st.caption("Trang này chưa có bbox nào trong JSON.")
-        return
-
-    sorted_elements = sorted(
-        elements,
-        key=lambda item: (int(item[1].get("reading_order", item[0])), item[0]),
-    )
-    colors = get_label_colors()
-
-    for element_index, element in sorted_elements:
-        element_id = make_element_id(st.session_state.current_page, element_index)
-        is_selected = element_id == st.session_state.selected_element_id
-        label = str(element.get("label", "text"))
-        reading_order = int(element.get("reading_order", element_index))
-        preview = str(element.get("text", "")).replace("\n", " ").strip() or "(Không có text)"
-        preview = preview[:110] + ("…" if len(preview) > 110 else "")
-        color = colors.get(label, "#4159e3")
-        button_label = f"{label} · RO {reading_order}"
-        if is_selected:
-            button_label = f"✓ {button_label}"
-
-        cols = st.columns([1, 6], vertical_alignment="top")
-        with cols[0]:
-            st.markdown(
-                f"<div style='width:14px;height:14px;margin-top:10px;border-radius:999px;background:{color};'></div>",
-                unsafe_allow_html=True,
-            )
-        with cols[1]:
-            if st.button(
-                button_label,
-                key=f"select-{element_id}",
-                use_container_width=True,
-                type="primary" if is_selected else "secondary",
-            ):
-                select_element(element_id)
-                set_mode("edit")
-                st.rerun()
-            st.caption(preview)
-
-
-
 def render_edit_panel(page_width: float, page_height: float) -> None:
     st.subheader("Chỉnh bbox đang chọn")
     selected = get_selected_element()
 
     if selected is None:
-        st.info("Bấm vào một bbox ở giữa hoặc chọn từ danh sách bên phải để chỉnh label, text và toạ độ.")
+        st.info("Bấm vào một bbox trên viewer để chỉnh label, text và toạ độ.")
         return
 
     selected_id, element, page_number, _ = selected
@@ -473,7 +427,7 @@ document = get_document()
 if document is None:
     st.title("PDF label studio")
     st.info(
-        "Hãy load một cặp file PDF + JSON ở sidebar. App sẽ hiện PDF ở giữa, danh sách bbox và form chỉnh sửa ở panel bên phải.",
+        "Hãy load một cặp file PDF + JSON ở sidebar. App sẽ hiện PDF ở giữa và form chỉnh sửa ở panel bên phải.",
         icon=":material/upload_file:",
     )
     st.stop()
@@ -521,11 +475,6 @@ with viewer_col:
         handle_viewer_events(viewer_result, page_width, page_height)
 
 with editor_col:
-    with st.container(border=True):
-        render_bbox_list_panel()
-
-    st.space("small")
-
     with st.container(border=True):
         if st.session_state.mode == "edit":
             render_edit_panel(page_width, page_height)
