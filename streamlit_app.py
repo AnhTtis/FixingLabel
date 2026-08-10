@@ -1,980 +1,530 @@
 from __future__ import annotations
 
-from io import BytesIO
 from pathlib import Path
-from typing import Any
-import json
-import sys
 
-import pandas as pd
 import streamlit as st
-from PIL import Image
 
-
-def ensure_streamlit_drawable_canvas_compat() -> None:
-    """Patch Streamlit internals expected by streamlit-drawable-canvas on newer Streamlit builds."""
-    try:
-        import streamlit.elements.image as st_image
-        if hasattr(st_image, "image_to_url"):
-            return
-        from streamlit.elements.lib.image_utils import image_to_url as raw_image_to_url
-        from streamlit.elements.lib.layout_utils import create_layout_config
-    except Exception:
-        return
-
-    def _compat_image_to_url(image, width, clamp, channels, output_format, image_id):
-        layout_config = create_layout_config(width=width, allow_content_width=True)
-        return raw_image_to_url(image, layout_config, clamp, channels, output_format, image_id)
-
-    st_image.image_to_url = _compat_image_to_url
-
-
-ensure_streamlit_drawable_canvas_compat()
-import streamlit_drawable_canvas as drawable_canvas_module
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-BACKEND_DIR = PROJECT_ROOT / "backend"
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
-
-from app.core.config import resolve_labels_path  # noqa: E402
-from app.schemas.annotation import AnnotationDocument, BBoxPatch, DeletePatch, LabelPatch  # noqa: E402
-from app.services.annotation_io import (  # noqa: E402
-    export_annotation_json,
-    export_label_definitions_json,
-    load_label_definitions,
-    prepare_annotation,
-    write_annotation_file,
-    write_label_definitions_file,
+from labeling_app.components.bbox_viewer import bbox_viewer
+from labeling_app.io import (
+    build_document_from_uploads,
+    discover_local_pairs,
+    export_annotation_bytes,
+    load_local_document,
+    save_annotation,
 )
-from app.services.editor_adapter import (  # noqa: E402
-    box_option_label,
-    build_canvas_boxes,
-    build_canvas_initial_drawing,
-    build_page_geometry,
-    canvas_box_to_pdf_bbox,
-    canvas_json_to_payload,
-    canvas_payload_to_patch_operations,
-    current_page,
-    label_display_name,
-    label_display_option,
-    label_lookup,
-    page_label_count,
-    page_option_label,
-    rgba_from_hex,
+from labeling_app.pdf_render import get_pdf_page_count, render_page_as_data_uri
+from labeling_app.state import (
+    add_element,
+    clear_draft_bbox,
+    clear_selection,
+    delete_selected_element,
+    get_annotation,
+    get_document,
+    get_label_choices,
+    get_label_colors,
+    get_page_count,
+    get_page_elements,
+    get_selected_element,
+    get_viewer_elements,
+    init_app_state,
+    load_document,
+    make_element_id,
+    mark_clean,
+    next_reading_order,
+    pop_flash,
+    select_element,
+    set_current_page,
+    set_draft_bbox,
+    set_flash,
+    set_mode,
+    update_element_bbox,
+    update_selected_element,
 )
-from app.services.patch_apply import PatchApplyError, apply_patches  # noqa: E402
-from app.services.pdf_render import render_page_png  # noqa: E402
 
-BASE_RENDER_SCALE = 1.5
-STATE_KEY = "fixinglabel_state"
-UPLOAD_MODE = "Upload files (web)"
-PATH_MODE = "Local file paths"
-CANVAS_SELECT_MODE = "Select / resize"
-CANVAS_DRAW_MODE = "Draw new boxes"
+st.set_page_config(
+    page_title="PDF label studio",
+    page_icon="🏷️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.set_page_config(page_title="FixingLabel Streamlit", layout="wide")
+init_app_state()
 
 
 
-def empty_state() -> dict[str, Any]:
-    return {
-        "annotation": None,
-        "labels": {"labels": []},
-        "pdf_source": None,
-        "pdf_name": "",
-        "annotation_path": "",
-        "annotation_name": "",
-        "labels_path": "",
-        "labels_name": "labels.json",
-        "persist_to_disk": False,
-        "source_mode": UPLOAD_MODE,
-        "current_page": 1,
-        "selected_element_id": "",
-        "zoom": 1.0,
-        "canvas_mode": CANVAS_SELECT_MODE,
-        "new_box_label": "",
-        "canvas_drafts": {},
-        "last_error": None,
-        "last_warning": None,
-        "last_success": None,
-    }
-
-
-
-def state() -> dict[str, Any]:
-    if STATE_KEY not in st.session_state:
-        st.session_state[STATE_KEY] = empty_state()
-    return st.session_state[STATE_KEY]
-
-
-
-def initialize_inputs() -> None:
-    default_labels_path = str(resolve_labels_path())
-    st.session_state.setdefault("source_mode_input", UPLOAD_MODE)
-    st.session_state.setdefault("pdf_path_input", "")
-    st.session_state.setdefault("annotation_path_input", "")
-    st.session_state.setdefault("labels_path_input", default_labels_path)
-
-
-
-def reset_editor() -> None:
-    st.session_state[STATE_KEY] = empty_state()
-
-
-
-def set_success(message: str) -> None:
-    current = state()
-    current["last_success"] = message
-    current["last_error"] = None
-
-
-
-def set_warning(message: str | None) -> None:
-    current = state()
-    current["last_warning"] = message
-
-
-
-def set_error(message: str) -> None:
-    current = state()
-    current["last_error"] = message
-    current["last_success"] = None
-
-
-
-def clear_messages() -> None:
-    current = state()
-    current["last_error"] = None
-    current["last_warning"] = None
-    current["last_success"] = None
-
-
-
-@st.cache_data(show_spinner=False, max_entries=32)
-def render_page_png_cached(pdf_source: bytes | str | Path, page_number: int, zoom: float) -> bytes:
-    return render_page_png(pdf_source, page_number, scale=BASE_RENDER_SCALE * float(zoom))
-
-
-
-def render_page_image(pdf_source: bytes | str | Path, page_number: int, zoom: float) -> Image.Image:
-    png_bytes = render_page_png_cached(pdf_source, page_number, float(zoom))
-    image = Image.open(BytesIO(png_bytes)).convert("RGBA")
-    image.load()
-    return image
-
-
-
-def image_to_data_url(image: Image.Image, output_format: str = "PNG") -> str:
-    buffer = BytesIO()
-    image.save(buffer, format=output_format)
-    encoded = drawable_canvas_module.base64.b64encode(buffer.getvalue()).decode("ascii")
-    media_type = f"image/{output_format.lower()}"
-    return f"data:{media_type};base64,{encoded}"
-
-
-
-def stable_st_canvas(
-    *,
-    fill_color: str,
-    stroke_width: int,
-    stroke_color: str,
-    background_color: str = "",
-    background_image: Image.Image | None = None,
-    update_streamlit: bool = True,
-    height: int = 400,
-    width: int = 600,
-    drawing_mode: str = "freedraw",
-    initial_drawing: dict[str, Any] | None = None,
-    display_toolbar: bool = True,
-    point_display_radius: int = 3,
-    key: str | None = None,
-):
-    background_image_url = None
-    if background_image is not None:
-        background_image = drawable_canvas_module._resize_img(background_image, height, width)
-        background_image_url = image_to_data_url(background_image)
-        background_color = ""
-
-    drawing = {"version": "4.4.0"} if initial_drawing is None else dict(initial_drawing)
-    drawing["background"] = background_color
-
-    component_value = drawable_canvas_module._component_func(
-        fillColor=fill_color,
-        strokeWidth=stroke_width,
-        strokeColor=stroke_color,
-        backgroundColor=background_color,
-        backgroundImageURL=background_image_url,
-        realtimeUpdateStreamlit=update_streamlit and (drawing_mode != "polygon"),
-        canvasHeight=height,
-        canvasWidth=width,
-        drawingMode=drawing_mode,
-        initialDrawing=drawing,
-        displayToolbar=display_toolbar,
-        displayRadius=point_display_radius,
-        key=key,
-        default=None,
-    )
-    if component_value is None:
-        return drawable_canvas_module.CanvasResult()
-
-    return drawable_canvas_module.CanvasResult(
-        drawable_canvas_module.np.asarray(drawable_canvas_module._data_url_to_image(component_value["data"])),
-        component_value["raw"],
-    )
-
-
-
-def fit_canvas_image(image: Image.Image, max_width: int = 900) -> Image.Image:
-    if image.width <= max_width:
-        return image
-    scale = max_width / float(image.width)
-    resized_height = max(1, int(round(image.height * scale)))
-    return image.resize((max_width, resized_height), Image.Resampling.LANCZOS)
-
-
-
-def clear_canvas_drafts(editor_state: dict[str, Any]) -> None:
-    editor_state["canvas_drafts"] = {}
-
-
-
-def canvas_draft_key(document_id: str, page_number: int, zoom: float, version: int) -> str:
-    return f"{document_id}:{page_number}:{int(float(zoom) * 100)}:{version}"
-
-
-
-def valid_canvas_json(canvas_json: dict[str, Any] | None) -> dict[str, Any] | None:
-    if isinstance(canvas_json, dict) and isinstance(canvas_json.get("objects"), list):
-        return canvas_json
-    return None
-
-
-
-def select_live_canvas_box(
-    editor_state: dict[str, Any],
-    payload: list[dict[str, Any]],
-    existing_boxes: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    selected_id = str(editor_state.get("selected_element_id") or "")
-    if selected_id:
-        for box in payload:
-            if str(box.get("id") or "") == selected_id:
-                return box
-
-    changed_existing = [
-        box for box in payload
-        if box.get("id") and any(
-            str(existing.get("id") or "") == str(box.get("id") or "") and canvas_box_changed(box, existing)
-            for existing in existing_boxes
-        )
-    ]
-    if len(changed_existing) == 1:
-        return changed_existing[0]
-
-    draft_boxes = [box for box in payload if not box.get("id")]
-    if draft_boxes:
-        return draft_boxes[-1]
-    return None
-
-
-
-def selected_element(editor_state: dict[str, Any]):
-    annotation: AnnotationDocument | None = editor_state.get("annotation")
-    selected_id = editor_state.get("selected_element_id") or ""
-    if annotation is None or not selected_id:
-        return None
-    page = current_page(annotation, int(editor_state["current_page"]))
-    return next((element for element in page.elements if element.id == selected_id), None)
-
-
-
-def ensure_valid_selection(editor_state: dict[str, Any]) -> None:
-    annotation: AnnotationDocument | None = editor_state.get("annotation")
-    if annotation is None:
-        editor_state["selected_element_id"] = ""
+def show_flash_message() -> None:
+    flash = pop_flash()
+    if not flash:
         return
 
-    page = current_page(annotation, int(editor_state["current_page"]))
-    valid_ids = {element.id for element in page.elements}
-    if editor_state.get("selected_element_id") not in valid_ids:
-        editor_state["selected_element_id"] = ""
-
-
-
-def label_ids(editor_state: dict[str, Any]) -> list[str]:
-    labels_payload = editor_state.get("labels") or {"labels": []}
-    return [str(label["id"]) for label in labels_payload.get("labels", [])]
-
-
-
-def annotation_output_name(editor_state: dict[str, Any]) -> str:
-    if editor_state.get("annotation_path"):
-        return Path(editor_state["annotation_path"]).name
-    return editor_state.get("annotation_name") or "corrected.annotations.json"
-
-
-
-def labels_output_name(editor_state: dict[str, Any]) -> str:
-    if editor_state.get("labels_path"):
-        return Path(editor_state["labels_path"]).name
-    return editor_state.get("labels_name") or "labels.json"
-
-
-
-def save_annotation(editor_state: dict[str, Any], annotation: AnnotationDocument) -> str:
-    if editor_state.get("persist_to_disk") and editor_state.get("annotation_path"):
-        write_annotation_file(annotation, editor_state["annotation_path"])
-        return f"Wrote changes to {annotation_output_name(editor_state)}."
-    return f"Saved changes in this session. Download {annotation_output_name(editor_state)} to keep them."
-
-
-
-def save_labels(editor_state: dict[str, Any], labels_payload: dict[str, Any]) -> str:
-    if editor_state.get("persist_to_disk") and editor_state.get("labels_path"):
-        write_label_definitions_file(labels_payload, editor_state["labels_path"])
-        return f"Wrote label names to {labels_output_name(editor_state)}."
-    return f"Saved label names in this session. Download {labels_output_name(editor_state)} to keep them."
-
-
-
-def default_labels_name() -> str:
-    return resolve_labels_path().name
-
-
-
-def load_document(pdf_path_value: str, annotation_path_value: str, labels_path_value: str) -> None:
-    editor_state = state()
-    clear_messages()
-
-    pdf_path = Path(pdf_path_value).expanduser()
-    annotation_path = Path(annotation_path_value).expanduser()
-    labels_path = resolve_labels_path(labels_path_value.strip() or None)
-
-    if not pdf_path.exists():
-        set_error(f"PDF path does not exist: {pdf_path}")
-        return
-    if not annotation_path.exists():
-        set_error(f"Annotation JSON path does not exist: {annotation_path}")
-        return
-
-    try:
-        annotation = prepare_annotation(
-            pdf_name=pdf_path.name,
-            pdf_source=pdf_path,
-            annotation_text=annotation_path.read_text(encoding="utf-8"),
-        )
-        labels = load_label_definitions(annotation, labels_path=labels_path)
-    except Exception as error:  # noqa: BLE001
-        set_error(str(error))
-        return
-
-    editor_state.update(
-        {
-            "annotation": annotation,
-            "labels": labels,
-            "pdf_source": str(pdf_path),
-            "pdf_name": pdf_path.name,
-            "annotation_path": str(annotation_path),
-            "annotation_name": annotation_path.name,
-            "labels_path": str(labels_path),
-            "labels_name": labels_path.name,
-            "persist_to_disk": True,
-            "source_mode": PATH_MODE,
-            "current_page": 1,
-            "selected_element_id": "",
-            "zoom": 1.0,
-            "canvas_mode": CANVAS_SELECT_MODE,
-            "new_box_label": "",
-            "canvas_drafts": {},
-            "last_error": None,
-            "last_warning": None,
-            "last_success": f"Loaded {pdf_path.name} and {annotation_path.name}.",
-        }
-    )
-    available_labels = label_ids(editor_state)
-    editor_state["new_box_label"] = available_labels[0] if available_labels else ""
-    st.session_state["labels_path_input"] = str(labels_path)
-
-
-
-def load_uploaded_document(uploaded_pdf: Any, uploaded_annotation: Any, uploaded_labels: Any) -> None:
-    editor_state = state()
-    clear_messages()
-
-    if uploaded_pdf is None or uploaded_annotation is None:
-        set_error("Upload both a PDF file and an annotation JSON file.")
-        return
-
-    try:
-        pdf_bytes = uploaded_pdf.getvalue()
-        annotation_text = uploaded_annotation.getvalue().decode("utf-8")
-        labels_payload = None
-        labels_name = default_labels_name()
-        if uploaded_labels is not None:
-            labels_payload = json.loads(uploaded_labels.getvalue().decode("utf-8"))
-            labels_name = uploaded_labels.name
-
-        annotation = prepare_annotation(
-            pdf_name=uploaded_pdf.name,
-            pdf_source=pdf_bytes,
-            annotation_text=annotation_text,
-        )
-        labels = load_label_definitions(annotation, labels_payload=labels_payload) if labels_payload is not None else load_label_definitions(annotation)
-    except Exception as error:  # noqa: BLE001
-        set_error(str(error))
-        return
-
-    editor_state.update(
-        {
-            "annotation": annotation,
-            "labels": labels,
-            "pdf_source": pdf_bytes,
-            "pdf_name": uploaded_pdf.name,
-            "annotation_path": "",
-            "annotation_name": uploaded_annotation.name,
-            "labels_path": "",
-            "labels_name": labels_name,
-            "persist_to_disk": False,
-            "source_mode": UPLOAD_MODE,
-            "current_page": 1,
-            "selected_element_id": "",
-            "zoom": 1.0,
-            "canvas_mode": CANVAS_SELECT_MODE,
-            "new_box_label": "",
-            "canvas_drafts": {},
-            "last_error": None,
-            "last_warning": None,
-            "last_success": f"Loaded uploads {uploaded_pdf.name} and {uploaded_annotation.name}.",
-        }
-    )
-    available_labels = label_ids(editor_state)
-    editor_state["new_box_label"] = available_labels[0] if available_labels else ""
-
-
-
-def apply_element_updates(selected_id: str, label_id: str, bbox: list[float]) -> None:
-    editor_state = state()
-    annotation: AnnotationDocument | None = editor_state.get("annotation")
-    if annotation is None or not selected_id:
-        return
-
-    operations = []
-    element = selected_element(editor_state)
-    if element is None:
-        set_error("Select a box before saving changes.")
-        return
-
-    rounded_bbox = [round(value, 2) for value in bbox]
-    if element.label != label_id:
-        operations.append(LabelPatch(op="update_label", page=int(editor_state["current_page"]), element_id=selected_id, label=label_id))
-    if [round(value, 2) for value in element.bbox] != rounded_bbox:
-        operations.append(BBoxPatch(op="update_bbox", page=int(editor_state["current_page"]), element_id=selected_id, bbox=rounded_bbox))
-
-    if not operations:
-        set_warning("No box changes to save.")
-        return
-
-    try:
-        working_copy = annotation.model_copy(deep=True)
-        updated = apply_patches(working_copy, operations)
-        editor_state["annotation"] = updated
-        clear_canvas_drafts(editor_state)
-        editor_state["selected_element_id"] = selected_id
-        editor_state["last_error"] = None
-        editor_state["last_warning"] = None
-        editor_state["last_success"] = f"Saved box {selected_id}. {save_annotation(editor_state, updated)}"
-    except PatchApplyError as error:
-        set_error(str(error))
-
-
-
-def delete_selected_box(selected_id: str) -> None:
-    editor_state = state()
-    annotation: AnnotationDocument | None = editor_state.get("annotation")
-    if annotation is None or not selected_id:
-        return
-
-    try:
-        working_copy = annotation.model_copy(deep=True)
-        updated = apply_patches(
-            working_copy,
-            [DeletePatch(op="delete_element", page=int(editor_state["current_page"]), element_id=selected_id)],
-        )
-        editor_state["annotation"] = updated
-        clear_canvas_drafts(editor_state)
-        editor_state["selected_element_id"] = ""
-        editor_state["last_error"] = None
-        editor_state["last_warning"] = None
-        editor_state["last_success"] = f"Deleted box {selected_id}. {save_annotation(editor_state, updated)}"
-    except PatchApplyError as error:
-        set_error(str(error))
-
-
-
-def save_label_names(edited_labels: pd.DataFrame) -> None:
-    editor_state = state()
-    updated_labels: list[dict[str, str]] = []
-    for row in edited_labels.to_dict("records"):
-        label_id = str(row.get("id", "")).strip()
-        if not label_id:
-            continue
-        updated_labels.append(
-            {
-                "id": label_id,
-                "name": str(row.get("name", "")).strip() or label_id,
-                "shortcut": str(row.get("shortcut", "")).strip(),
-                "color": str(row.get("color", "#6b7280")).strip() or "#6b7280",
-            }
-        )
-
-    labels_payload = {"labels": updated_labels}
-    try:
-        message = save_labels(editor_state, labels_payload)
-    except OSError as error:
-        set_error(str(error))
-        return
-
-    editor_state["labels"] = labels_payload
-    if editor_state.get("new_box_label") not in label_ids(editor_state):
-        available_labels = label_ids(editor_state)
-        editor_state["new_box_label"] = available_labels[0] if available_labels else ""
-    editor_state["last_error"] = None
-    editor_state["last_warning"] = None
-    editor_state["last_success"] = message
-
-
-
-def build_elements_dataframe(editor_state: dict[str, Any]) -> pd.DataFrame:
-    annotation: AnnotationDocument | None = editor_state.get("annotation")
-    if annotation is None:
-        return pd.DataFrame(columns=["id", "label", "label_name", "bbox"])
-
-    page = current_page(annotation, int(editor_state["current_page"]))
-    rows = [
-        {
-            "id": element.id,
-            "label": element.label,
-            "label_name": label_display_name(editor_state.get("labels"), element.label),
-            "bbox": ", ".join(f"{value:.2f}" for value in element.bbox),
-        }
-        for element in page.elements
-    ]
-    return pd.DataFrame(rows)
-
-
-
-def build_labels_dataframe(editor_state: dict[str, Any]) -> pd.DataFrame:
-    labels = (editor_state.get("labels") or {"labels": []}).get("labels", [])
-    return pd.DataFrame(
-        [
-            {
-                "id": str(label.get("id", "")),
-                "name": str(label.get("name", label.get("id", ""))),
-                "shortcut": str(label.get("shortcut", "")),
-                "color": str(label.get("color", "#6b7280")),
-            }
-            for label in labels
-        ]
-    )
-
-
-
-def canvas_box_changed(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:
-    return any(abs(float(candidate[key]) - float(existing[key])) > 0.01 for key in ("left", "top", "width", "height"))
-
-
-
-def infer_canvas_selection_id(
-    payload: list[dict[str, Any]],
-    existing_boxes: list[dict[str, Any]],
-    current_selected_id: str,
-) -> str:
-    existing_by_id = {str(box["id"]): box for box in existing_boxes if box.get("id")}
-    changed_ids: list[str] = []
-
-    for box in payload:
-        element_id = str(box.get("id") or "")
-        if not element_id:
-            continue
-        existing = existing_by_id.get(element_id)
-        if existing is not None and canvas_box_changed(box, existing):
-            changed_ids.append(element_id)
-
-    if len(changed_ids) == 1:
-        return changed_ids[0]
-    if current_selected_id and current_selected_id in existing_by_id:
-        return current_selected_id
-    return ""
-
-
-
-def apply_canvas_changes(
-    canvas_json: dict[str, Any] | None,
-    existing_boxes: list[dict[str, Any]],
-    new_box_label: str,
-    image_width: int,
-    image_height: int,
-) -> None:
-    editor_state = state()
-    annotation: AnnotationDocument | None = editor_state.get("annotation")
-    if annotation is None:
-        return
-
-    page = current_page(annotation, int(editor_state["current_page"]))
-    geometry = build_page_geometry(page, image_width, image_height)
-    payload = canvas_json_to_payload(canvas_json, existing_boxes, new_box_label)
-    operations, created_ids, missing_existing_ids = canvas_payload_to_patch_operations(
-        page,
-        geometry,
-        payload,
-        editor_state.get("labels"),
-    )
-
-    if not operations:
-        if len(payload) < len(existing_boxes):
-            set_warning("Canvas changes did not include every existing box. Boxes are not auto-deleted; use the delete action in the properties panel.")
-        else:
-            set_warning("No canvas changes to save.")
-        return
-
-    try:
-        working_copy = annotation.model_copy(deep=True)
-        updated = apply_patches(working_copy, operations)
-        editor_state["annotation"] = updated
-        clear_canvas_drafts(editor_state)
-        updated_existing_ids = [operation.element_id for operation in operations if getattr(operation, "op", "") == "update_bbox"]
-        if created_ids:
-            editor_state["selected_element_id"] = created_ids[-1]
-        elif len(updated_existing_ids) == 1:
-            editor_state["selected_element_id"] = updated_existing_ids[0]
-        editor_state["last_error"] = None
-        editor_state["last_warning"] = None
-        editor_state["last_success"] = f"Applied canvas changes. {save_annotation(editor_state, updated)}"
-        if missing_existing_ids:
-            editor_state["last_warning"] = (
-                "Canvas changes do not automatically delete missing boxes. "
-                "Use the delete action in the properties panel if needed."
-            )
-    except PatchApplyError as error:
-        set_error(str(error))
-
-
-
-def render_status(editor_state: dict[str, Any]) -> None:
-    if editor_state.get("last_error"):
-        st.error(editor_state["last_error"])
-    elif editor_state.get("last_warning"):
-        st.warning(editor_state["last_warning"])
-    elif editor_state.get("last_success"):
-        st.success(editor_state["last_success"])
+    kind = flash.get("kind")
+    message = flash.get("message", "")
+
+    if kind == "success":
+        st.success(message, icon=":material/check_circle:")
+    elif kind == "warning":
+        st.warning(message, icon=":material/warning:")
     else:
-        st.info("Ready.")
+        st.info(message, icon=":material/info:")
 
 
 
-def render_loaded_document(editor_state: dict[str, Any]) -> None:
-    annotation: AnnotationDocument = editor_state["annotation"]
-    page_numbers = [page.page_number for page in annotation.pages]
-    current_page_number = int(editor_state.get("current_page", 1))
-    if current_page_number not in page_numbers:
-        current_page_number = page_numbers[0]
-        editor_state["current_page"] = current_page_number
+def sync_visible_labels() -> list[str]:
+    labels = get_label_choices()
+    current = list(st.session_state.get("visible_labels", []))
+    normalized = [label for label in current if label in labels]
 
-    selected_page = st.selectbox(
-        "Page",
-        options=page_numbers,
-        index=page_numbers.index(current_page_number),
-        format_func=lambda page_number: page_option_label(current_page(annotation, page_number)),
-    )
-    if selected_page != editor_state["current_page"]:
-        editor_state["current_page"] = selected_page
-        editor_state["selected_element_id"] = ""
+    if not normalized and labels:
+        normalized = labels.copy()
 
-    zoom = st.slider("Zoom", min_value=0.5, max_value=2.5, value=float(editor_state.get("zoom", 1.0)), step=0.1)
-    editor_state["zoom"] = zoom
-    ensure_valid_selection(editor_state)
+    new_labels = [label for label in labels if label not in normalized]
+    merged = normalized + new_labels
 
-    page = current_page(annotation, int(editor_state["current_page"]))
-    available_labels = label_ids(editor_state)
-    if not editor_state.get("new_box_label") and available_labels:
-        editor_state["new_box_label"] = available_labels[0]
-    if editor_state.get("new_box_label") and editor_state["new_box_label"] not in available_labels:
-        editor_state["new_box_label"] = available_labels[0] if available_labels else ""
+    if merged != current:
+        st.session_state.visible_labels = merged
 
-    st.caption(
-        f"{annotation.source_pdf} · page {page.page_number}/{len(annotation.pages)} · "
-        f"{len(page.elements)} box(es) · {page_label_count(page)} label(s) · version {annotation.meta.version}"
-    )
+    return labels
 
-    controls_col, mode_col = st.columns([1.4, 1.0], gap="medium")
-    with controls_col:
-        new_box_label = st.selectbox(
-            "New box label",
-            options=available_labels,
-            index=available_labels.index(editor_state["new_box_label"]) if available_labels else 0,
-            format_func=lambda value: label_display_option(editor_state.get("labels"), value),
-            disabled=not available_labels,
-        ) if available_labels else ""
-        editor_state["new_box_label"] = new_box_label
-    with mode_col:
-        editor_state["canvas_mode"] = st.radio(
-            "Canvas mode",
-            options=[CANVAS_SELECT_MODE, CANVAS_DRAW_MODE],
-            index=0 if editor_state.get("canvas_mode") == CANVAS_SELECT_MODE else 1,
-            horizontal=True,
-        )
-    drawing_mode = "transform" if editor_state.get("canvas_mode") == CANVAS_SELECT_MODE else "rect"
-    stroke_color = label_lookup(editor_state.get("labels")).get(new_box_label, {}).get("color", "#2563eb")
 
-    original_image = render_page_image(editor_state["pdf_source"], page.page_number, float(editor_state["zoom"]))
-    image = fit_canvas_image(original_image).convert("RGB")
-    geometry = build_page_geometry(page, image.width, image.height)
-    canvas_boxes = build_canvas_boxes(page, geometry, editor_state.get("labels"))
 
-    draft_key = canvas_draft_key(annotation.document_id, page.page_number, float(editor_state["zoom"]), int(annotation.meta.version))
-    canvas_drafts = editor_state.setdefault("canvas_drafts", {})
-    initial_drawing = valid_canvas_json(canvas_drafts.get(draft_key)) or build_canvas_initial_drawing(canvas_boxes)
-    canvas_key = f"canvas-{draft_key}"
+def render_local_loader() -> None:
+    st.subheader("Sample local")
+    st.caption("Dùng nhanh cặp `.pdf` + `.json` đang có sẵn trong repo.")
 
-    st.markdown(
-        """
-        <style>
-        .fixinglabel-sticky-panel { position: sticky; top: 1rem; }
-        .fixinglabel-panel-scroll { max-height: calc(100vh - 8rem); overflow-y: auto; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    local_pairs = discover_local_pairs(Path.cwd())
+    if not local_pairs:
+        st.caption("Không tìm thấy cặp file `.json` + `.pdf` cùng tên trong thư mục hiện tại.")
+        return
 
-    canvas_col, details_col = st.columns([3.0, 1.2], gap="medium")
+    options = ["— Chọn sample local —", *[pair["label"] for pair in local_pairs]]
+    selected_label = st.selectbox("Sample local", options=options, key="local_pair_selector")
 
-    with canvas_col:
-        canvas_result = drawable_canvas_module.st_canvas(
-            fill_color=rgba_from_hex(stroke_color, 0.08),
-            stroke_width=2,
-            stroke_color=stroke_color,
-            background_image=image,
-            update_streamlit=True,
-            height=image.height,
-            width=image.width,
-            drawing_mode=drawing_mode,
-            initial_drawing=initial_drawing,
-            display_toolbar=False,
-            key=canvas_key,
-        )
-
-        live_canvas_json = valid_canvas_json(getattr(canvas_result, "json_data", None))
-        if live_canvas_json is not None:
-            canvas_drafts[draft_key] = live_canvas_json
-        active_canvas_json = live_canvas_json or valid_canvas_json(canvas_drafts.get(draft_key)) or initial_drawing
-
-        canvas_payload = canvas_json_to_payload(active_canvas_json, canvas_boxes, new_box_label)
-        inferred_selected_id = infer_canvas_selection_id(
-            canvas_payload,
-            canvas_boxes,
-            editor_state.get("selected_element_id") or "",
-        )
-        if inferred_selected_id and inferred_selected_id != editor_state.get("selected_element_id"):
-            editor_state["selected_element_id"] = inferred_selected_id
-
-        st.caption(
-            "Interact directly on the PDF canvas. Moving, resizing, or drawing a box updates the panel on the right; "
-            "the selector in that panel is kept as a reliable fallback for choosing an existing box."
-        )
-        if st.button("Apply canvas changes", type="primary", width="stretch"):
-            apply_canvas_changes(active_canvas_json, canvas_boxes, new_box_label, image.width, image.height)
+    if st.button("Load sample local", use_container_width=True):
+        if selected_label == options[0]:
+            set_flash("warning", "Hãy chọn một sample local trước khi load.")
             st.rerun()
 
-        st.subheader("Boxes on this page")
-        st.dataframe(build_elements_dataframe(editor_state), hide_index=True, width="stretch")
+        pair = next(pair for pair in local_pairs if pair["label"] == selected_label)
+        try:
+            document = load_local_document(Path(pair["json_path"]), Path(pair["pdf_path"]))
+        except Exception as error:  # pragma: no cover - UI feedback
+            set_flash("warning", f"Không load được sample local: {error}")
+            st.rerun()
 
-    payload_by_id = {str(box.get("id") or ""): box for box in canvas_payload if str(box.get("id") or "")}
-    selected_id_options = [""] + [element.id for element in page.elements]
-    current_selected_id = editor_state.get("selected_element_id") or ""
-    if current_selected_id not in selected_id_options:
-        current_selected_id = ""
-
-    live_selected_box = select_live_canvas_box(editor_state, canvas_payload, canvas_boxes)
-    if live_selected_box is None and current_selected_id:
-        live_selected_box = payload_by_id.get(current_selected_id)
-
-    with details_col:
-        st.markdown('<div class="fixinglabel-sticky-panel"><div class="fixinglabel-panel-scroll">', unsafe_allow_html=True)
-        detail_panel = st.container(border=True)
-        with detail_panel:
-            st.subheader("Selected box")
-            selected_id = st.selectbox(
-                "Selected existing box",
-                options=selected_id_options,
-                index=selected_id_options.index(current_selected_id),
-                format_func=lambda value: "No selection" if not value else box_option_label(page, editor_state.get("labels"), value),
-            )
-            editor_state["selected_element_id"] = selected_id
-            if live_selected_box is None and selected_id:
-                live_selected_box = payload_by_id.get(selected_id)
-
-            if live_selected_box is None:
-                st.info("Select a box from the list or move/draw one on the PDF to inspect it here.")
-            else:
-                live_label_id = str(live_selected_box.get("label") or new_box_label)
-                live_label_name = label_display_name(editor_state.get("labels"), live_label_id)
-                live_pdf_bbox = canvas_box_to_pdf_bbox(live_selected_box, geometry)
-                live_canvas_bbox = [
-                    round(float(live_selected_box.get("left", 0.0)), 2),
-                    round(float(live_selected_box.get("top", 0.0)), 2),
-                    round(float(live_selected_box.get("left", 0.0)) + float(live_selected_box.get("width", 0.0)), 2),
-                    round(float(live_selected_box.get("top", 0.0)) + float(live_selected_box.get("height", 0.0)), 2),
-                ]
-                element_id = str(live_selected_box.get("id") or "")
-
-                st.markdown(f"**Label:** {live_label_name}")
-                st.caption(f"Label ID: {live_label_id}")
-                if element_id:
-                    st.caption(f"Element ID: {element_id}")
-                else:
-                    st.caption("New box · unsaved until you apply canvas changes")
-
-                st.markdown("**Current bbox (PDF space)**")
-                st.code(json.dumps({"bbox": live_pdf_bbox}, ensure_ascii=False), language="json")
-                st.markdown("**Current bbox (canvas space)**")
-                st.code(json.dumps({"bbox": live_canvas_bbox}, ensure_ascii=False), language="json")
-
-                if element_id:
-                    current_label_ids = available_labels.copy()
-                    if live_label_id not in current_label_ids:
-                        current_label_ids.append(live_label_id)
-                    current_label_ids = current_label_ids or [live_label_id]
-                    current_label_index = current_label_ids.index(live_label_id)
-
-                    with st.form("box_editor_form"):
-                        label_id = st.selectbox(
-                            "Label ID",
-                            options=current_label_ids,
-                            index=current_label_index,
-                            format_func=lambda value: label_display_option(editor_state.get("labels"), value),
-                        )
-                        x0 = st.number_input("x0", value=float(live_pdf_bbox[0]), step=1.0, format="%.2f")
-                        y0 = st.number_input("y0", value=float(live_pdf_bbox[1]), step=1.0, format="%.2f")
-                        x1 = st.number_input("x1", value=float(live_pdf_bbox[2]), step=1.0, format="%.2f")
-                        y1 = st.number_input("y1", value=float(live_pdf_bbox[3]), step=1.0, format="%.2f")
-                        save_box = st.form_submit_button("Save box changes", type="primary")
-                        remove_box = st.form_submit_button("Delete selected box")
-
-                    if save_box:
-                        apply_element_updates(element_id, label_id, [x0, y0, x1, y1])
-                        st.rerun()
-                    if remove_box:
-                        delete_selected_box(element_id)
-                        st.rerun()
-                else:
-                    st.info("This box is still a draft. Click Apply canvas changes to create it in the annotation JSON.")
-        st.markdown('</div></div>', unsafe_allow_html=True)
-
-    st.subheader("Label names")
-    if editor_state.get("persist_to_disk"):
-        st.caption("Edit display names and save them directly to the labels JSON file.")
-    else:
-        st.caption("Edit display names in this browser session, then download the labels JSON to keep them.")
-    with st.form("label_names_form"):
-        edited_labels = st.data_editor(
-            build_labels_dataframe(editor_state),
-            hide_index=True,
-            width="stretch",
-            disabled=["id"],
-            column_config={
-                "id": st.column_config.TextColumn("Label ID"),
-                "name": st.column_config.TextColumn("Display name", required=True),
-                "shortcut": st.column_config.TextColumn("Shortcut"),
-                "color": st.column_config.TextColumn("Color"),
-            },
-            num_rows="fixed",
-        )
-        save_names = st.form_submit_button("Save label names", type="primary")
-
-    if save_names:
-        save_label_names(edited_labels)
+        load_document(document)
+        set_flash("success", f"Đã load {Path(pair['json_path']).name}.")
         st.rerun()
 
-    st.subheader("Downloads")
-    st.download_button(
-        "Download current annotation JSON",
-        data=export_annotation_json(annotation),
-        file_name=annotation_output_name(editor_state),
-        mime="application/json",
-        width="stretch",
-    )
-    st.download_button(
-        "Download current labels JSON",
-        data=export_label_definitions_json(editor_state.get("labels") or {"labels": []}),
-        file_name=labels_output_name(editor_state),
-        mime="application/json",
-        width="stretch",
-    )
 
 
+def render_upload_loader() -> None:
+    st.subheader("Upload tài liệu")
+    st.caption("Khi deploy, người dùng có thể tải PDF và JSON trực tiếp từ giao diện này.")
 
-def main() -> None:
-    initialize_inputs()
-    editor_state = state()
+    uploaded_pdf = st.file_uploader("PDF", type=["pdf"], key="uploaded_pdf")
+    uploaded_json = st.file_uploader("JSON", type=["json"], key="uploaded_json")
 
-    st.title("FixingLabel · Streamlit")
-    st.caption("Edit PDF labels in Streamlit with upload-based web mode and optional local path mode.")
-
-    with st.sidebar:
-        st.header("Document")
-        source_mode = st.radio("Input mode", options=[UPLOAD_MODE, PATH_MODE], key="source_mode_input")
-
-        if source_mode == UPLOAD_MODE:
-            uploaded_pdf = st.file_uploader("PDF", type=["pdf"])
-            uploaded_annotation = st.file_uploader("Annotation JSON", type=["json"])
-            uploaded_labels = st.file_uploader("Labels JSON (optional)", type=["json"])
-            load_clicked = st.button("Load uploaded files", type="primary", width="stretch")
-            if load_clicked:
-                load_uploaded_document(uploaded_pdf, uploaded_annotation, uploaded_labels)
-                st.rerun()
-            st.caption("Web deployment uses uploads and session state. Download the edited JSON files to keep your changes.")
-        else:
-            st.text_input("PDF path", key="pdf_path_input", placeholder="D:/path/to/document.pdf")
-            st.text_input("Annotation JSON path", key="annotation_path_input", placeholder="D:/path/to/document.annotations.json")
-            st.text_input("Labels JSON path", key="labels_path_input")
-            load_clicked = st.button("Load files", type="primary", width="stretch")
-            reload_clicked = st.button("Reload from disk", width="stretch")
-            if load_clicked or reload_clicked:
-                load_document(
-                    st.session_state["pdf_path_input"],
-                    st.session_state["annotation_path_input"],
-                    st.session_state["labels_path_input"],
-                )
-                st.rerun()
-            st.caption("Local path mode writes annotation and label edits back to disk immediately.")
-
-        unload_clicked = st.button("Unload current document", width="stretch")
-        if unload_clicked:
-            reset_editor()
-            clear_messages()
+    if st.button("Load file upload", use_container_width=True):
+        if uploaded_pdf is None or uploaded_json is None:
+            set_flash("warning", "Hãy chọn cả file PDF và JSON.")
             st.rerun()
 
-        if editor_state.get("annotation") is not None:
-            st.markdown(f"**Source mode:** `{editor_state['source_mode']}`")
-            st.markdown(f"**PDF:** `{editor_state['pdf_name']}`")
-            st.markdown(f"**Annotation JSON:** `{annotation_output_name(editor_state)}`")
-            st.markdown(f"**Labels JSON:** `{labels_output_name(editor_state)}`")
-            if editor_state.get("persist_to_disk"):
-                st.markdown(f"**Annotation path:** `{editor_state['annotation_path']}`")
-                st.markdown(f"**Labels path:** `{editor_state['labels_path']}`")
+        try:
+            document = build_document_from_uploads(uploaded_pdf, uploaded_json)
+        except Exception as error:  # pragma: no cover - UI feedback
+            set_flash("warning", f"Không đọc được file upload: {error}")
+            st.rerun()
 
-    render_status(editor_state)
+        load_document(document)
+        set_flash("success", f"Đã load {uploaded_json.name} và {uploaded_pdf.name}.")
+        st.rerun()
 
-    if editor_state.get("annotation") is None:
-        if st.session_state["source_mode_input"] == UPLOAD_MODE:
-            st.info("Upload a PDF and annotation JSON in the sidebar to start editing.")
-        else:
-            st.info("Enter local file paths in the sidebar, then load the document to start editing.")
+
+
+def render_document_controls(pdf_page_count: int) -> list[str]:
+    document = get_document()
+    annotation = get_annotation()
+    if document is None or annotation is None:
+        return []
+
+    annotation["total_pages"] = max(int(annotation.get("total_pages") or 0), pdf_page_count)
+    st.subheader("Điều khiển")
+
+    mode = st.segmented_control(
+        "Chế độ",
+        options=["edit", "create"],
+        format_func=lambda option: "Chỉnh label" if option == "edit" else "Tạo label mới",
+        key="mode",
+        width="stretch",
+    )
+    if mode not in {"edit", "create"}:
+        set_mode("edit")
+        st.rerun()
+
+    with st.container(horizontal=True, horizontal_alignment="distribute"):
+        if st.button("Trang trước", icon=":material/arrow_back:"):
+            set_current_page(st.session_state.current_page - 1)
+            st.rerun()
+        if st.button("Trang sau", icon=":material/arrow_forward:"):
+            set_current_page(min(st.session_state.current_page + 1, max(pdf_page_count, 1)))
+            st.rerun()
+
+    chosen_page = st.number_input(
+        "Trang hiện tại",
+        min_value=1,
+        max_value=max(pdf_page_count, 1),
+        value=int(st.session_state.current_page),
+        step=1,
+        help="Chọn trang muốn hiển thị và chỉnh label.",
+    )
+    if int(chosen_page) != int(st.session_state.current_page):
+        set_current_page(int(chosen_page))
+        st.rerun()
+
+    labels = sync_visible_labels()
+    visible_labels = st.multiselect(
+        "Label hiển thị",
+        options=labels,
+        key="visible_labels",
+        help="Ẩn hoặc hiện bbox theo từng loại label.",
+    )
+
+    st.subheader("Lưu kết quả")
+    export_bytes = export_annotation_bytes(annotation)
+    suggested_name = document["json_name"].removesuffix(".json") + "_edited.json"
+    st.download_button(
+        "Tải JSON đã chỉnh",
+        data=export_bytes,
+        file_name=suggested_name,
+        mime="application/json",
+        use_container_width=True,
+        icon=":material/download:",
+    )
+
+    if document.get("json_path"):
+        if st.button("Ghi đè file JSON hiện tại", use_container_width=True, icon=":material/save:"):
+            try:
+                save_annotation(annotation, Path(document["json_path"]))
+            except Exception as error:  # pragma: no cover - UI feedback
+                set_flash("warning", f"Không lưu được file JSON: {error}")
+            else:
+                mark_clean()
+                set_flash("success", f"Đã lưu vào {document['json_path']}.")
+            st.rerun()
+
+    status_text = "Có thay đổi chưa lưu" if document.get("dirty") else "Đã đồng bộ"
+    st.caption(f":material/task_alt: Trạng thái: **{status_text}**")
+    st.caption(f":material/picture_as_pdf: PDF: `{document['pdf_name']}`")
+    st.caption(f":material/data_object: JSON: `{document['json_name']}`")
+
+    return visible_labels
+
+
+
+def show_document_summary(pdf_page_count: int) -> None:
+    document = get_document()
+    annotation = get_annotation()
+    if document is None or annotation is None:
         return
 
-    render_loaded_document(editor_state)
+    total_elements = sum(len(page.get("elements", [])) for page in annotation.get("pages", []))
+    annotation_page_count = get_page_count()
+    current_elements = len(get_page_elements(st.session_state.current_page))
+
+    header_col, badge_col = st.columns([5, 2], vertical_alignment="center")
+    with header_col:
+        st.title("PDF label studio")
+        st.caption(
+            "Hiển thị trực tiếp trang PDF, click để chọn bbox, kéo thả để di chuyển/resize, và cập nhật JSON ngay trong app.",
+        )
+    with badge_col:
+        mode_label = "Chỉnh label" if st.session_state.mode == "edit" else "Tạo label mới"
+        dirty_label = "Chưa lưu" if document.get("dirty") else "Đã lưu"
+        st.markdown(f":blue-badge[{mode_label}] :orange-badge[{dirty_label}]")
+
+    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1.metric("Tổng số trang PDF", pdf_page_count)
+    metric_col2.metric("Trang trong JSON", annotation_page_count)
+    metric_col3.metric("BBox ở trang hiện tại", current_elements)
+    metric_col4.metric("Tổng số bbox", total_elements)
+
+    if annotation_page_count != pdf_page_count:
+        st.warning(
+            "Số trang trong JSON khác với PDF. App vẫn render theo PDF và giữ nguyên cấu trúc JSON khi lưu.",
+            icon=":material/warning:",
+        )
 
 
-if __name__ == "__main__":
-    main()
+
+def handle_viewer_events(viewer_result: dict[str, object], page_width: float, page_height: float) -> None:
+    selected = viewer_result.get("selected")
+    if isinstance(selected, str):
+        if selected == "__clear__":
+            clear_selection()
+        else:
+            select_element(selected)
+
+    draft_payload = viewer_result.get("draft_bbox")
+    if isinstance(draft_payload, dict):
+        bbox = draft_payload.get("bbox")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            set_draft_bbox([float(value) for value in bbox])
+
+    bbox_changed = viewer_result.get("bbox_changed")
+    if isinstance(bbox_changed, dict):
+        element_id = bbox_changed.get("id")
+        bbox = bbox_changed.get("bbox")
+        if isinstance(element_id, str) and isinstance(bbox, list) and len(bbox) == 4:
+            update_element_bbox(
+                element_id,
+                [float(value) for value in bbox],
+                page_width,
+                page_height,
+            )
+
+
+
+def render_bbox_list_panel() -> None:
+    st.subheader("Danh sách bbox trang hiện tại")
+    elements = list(enumerate(get_page_elements(st.session_state.current_page)))
+
+    if not elements:
+        st.caption("Trang này chưa có bbox nào trong JSON.")
+        return
+
+    sorted_elements = sorted(
+        elements,
+        key=lambda item: (int(item[1].get("reading_order", item[0])), item[0]),
+    )
+    colors = get_label_colors()
+
+    for element_index, element in sorted_elements:
+        element_id = make_element_id(st.session_state.current_page, element_index)
+        is_selected = element_id == st.session_state.selected_element_id
+        label = str(element.get("label", "text"))
+        reading_order = int(element.get("reading_order", element_index))
+        preview = str(element.get("text", "")).replace("\n", " ").strip() or "(Không có text)"
+        preview = preview[:110] + ("…" if len(preview) > 110 else "")
+        color = colors.get(label, "#4159e3")
+        button_label = f"{label} · RO {reading_order}"
+        if is_selected:
+            button_label = f"✓ {button_label}"
+
+        cols = st.columns([1, 6], vertical_alignment="top")
+        with cols[0]:
+            st.markdown(
+                f"<div style='width:14px;height:14px;margin-top:10px;border-radius:999px;background:{color};'></div>",
+                unsafe_allow_html=True,
+            )
+        with cols[1]:
+            if st.button(
+                button_label,
+                key=f"select-{element_id}",
+                use_container_width=True,
+                type="primary" if is_selected else "secondary",
+            ):
+                select_element(element_id)
+                set_mode("edit")
+                st.rerun()
+            st.caption(preview)
+
+
+
+def render_edit_panel(page_width: float, page_height: float) -> None:
+    st.subheader("Chỉnh bbox đang chọn")
+    selected = get_selected_element()
+
+    if selected is None:
+        st.info("Bấm vào một bbox ở giữa hoặc chọn từ danh sách bên phải để chỉnh label, text và toạ độ.")
+        return
+
+    selected_id, element, page_number, _ = selected
+    bbox = [float(value) for value in element.get("bbox", [0, 0, 0, 0])]
+    label_options = ", ".join(get_label_choices())
+
+    st.caption(f"Trang {page_number} · ID {selected_id}")
+    st.caption(f"Label hiện có: {label_options}")
+
+    with st.form(f"edit-form-{selected_id}"):
+        label = st.text_input("Tên label", value=str(element.get("label", "text")))
+
+        coord_col1, coord_col2 = st.columns(2)
+        with coord_col1:
+            x0 = st.number_input("x0", min_value=0.0, max_value=float(page_width), value=bbox[0], step=1.0)
+            y0 = st.number_input("y0", min_value=0.0, max_value=float(page_height), value=bbox[1], step=1.0)
+        with coord_col2:
+            x1 = st.number_input("x1", min_value=0.0, max_value=float(page_width), value=bbox[2], step=1.0)
+            y1 = st.number_input("y1", min_value=0.0, max_value=float(page_height), value=bbox[3], step=1.0)
+
+        text = st.text_area("Text", value=str(element.get("text", "")), height=180)
+        reading_order = st.number_input(
+            "Reading order",
+            value=int(element.get("reading_order", 0)),
+            step=1,
+        )
+        figure_path = st.text_input("Figure path (optional)", value=str(element.get("figure_path", "")))
+
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            save_clicked = st.form_submit_button("Cập nhật bbox", type="primary", use_container_width=True)
+        with action_col2:
+            delete_clicked = st.form_submit_button("Xóa bbox", use_container_width=True)
+
+    if save_clicked:
+        update_selected_element(
+            label=label,
+            bbox=[x0, y0, x1, y1],
+            text=text,
+            reading_order=int(reading_order),
+            figure_path=figure_path,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        set_flash("success", f"Đã cập nhật bbox {selected_id}.")
+        st.rerun()
+
+    if delete_clicked:
+        delete_selected_element()
+        set_flash("success", f"Đã xóa bbox {selected_id}.")
+        st.rerun()
+
+
+
+def render_create_panel(page_width: float, page_height: float) -> None:
+    st.subheader("Tạo label mới")
+    draft_bbox = st.session_state.get("draft_bbox")
+    label_options = ", ".join(get_label_choices())
+
+    if not draft_bbox:
+        st.info("Chuyển sang chế độ tạo mới rồi kéo chuột trên vùng PDF để tạo một bbox mới.")
+        return
+
+    st.caption(f"BBox nháp: {', '.join(f'{value:.1f}' for value in draft_bbox)}")
+    st.caption(f"Label hiện có: {label_options}")
+
+    with st.form(f"create-form-page-{st.session_state.current_page}"):
+        label = st.text_input("Tên label", value="text")
+
+        coord_col1, coord_col2 = st.columns(2)
+        with coord_col1:
+            x0 = st.number_input("x0", min_value=0.0, max_value=float(page_width), value=float(draft_bbox[0]), step=1.0)
+            y0 = st.number_input("y0", min_value=0.0, max_value=float(page_height), value=float(draft_bbox[1]), step=1.0)
+        with coord_col2:
+            x1 = st.number_input("x1", min_value=0.0, max_value=float(page_width), value=float(draft_bbox[2]), step=1.0)
+            y1 = st.number_input("y1", min_value=0.0, max_value=float(page_height), value=float(draft_bbox[3]), step=1.0)
+
+        text = st.text_area("Text", value="", height=180)
+        reading_order = st.number_input(
+            "Reading order",
+            value=next_reading_order(st.session_state.current_page),
+            step=1,
+        )
+        figure_path = st.text_input("Figure path (optional)", value="")
+
+        action_col1, action_col2 = st.columns(2)
+        with action_col1:
+            add_clicked = st.form_submit_button("Thêm bbox", type="primary", use_container_width=True)
+        with action_col2:
+            clear_clicked = st.form_submit_button("Bỏ bbox nháp", use_container_width=True)
+
+    if add_clicked:
+        new_element_id = add_element(
+            page_number=st.session_state.current_page,
+            label=label,
+            bbox=[x0, y0, x1, y1],
+            text=text,
+            reading_order=int(reading_order),
+            figure_path=figure_path,
+            page_width=page_width,
+            page_height=page_height,
+        )
+        clear_draft_bbox()
+        select_element(new_element_id)
+        set_mode("edit")
+        set_flash("success", f"Đã thêm bbox mới ở trang {st.session_state.current_page}.")
+        st.rerun()
+
+    if clear_clicked:
+        clear_draft_bbox()
+        set_flash("info", "Đã bỏ bbox nháp.")
+        st.rerun()
+
+
+with st.sidebar:
+    st.title("PDF label studio")
+    st.caption("Chuẩn bị sẵn cho việc deploy Streamlit: sample local, upload file, chỉnh trực tiếp và export JSON.")
+    render_local_loader()
+    st.space("small")
+    render_upload_loader()
+
+show_flash_message()
+
+document = get_document()
+if document is None:
+    st.title("PDF label studio")
+    st.info(
+        "Hãy load một cặp file PDF + JSON ở sidebar. App sẽ hiện PDF ở giữa, danh sách bbox và form chỉnh sửa ở panel bên phải.",
+        icon=":material/upload_file:",
+    )
+    st.stop()
+
+try:
+    pdf_page_count = get_pdf_page_count(document["pdf_bytes"])
+    if st.session_state.current_page > pdf_page_count:
+        st.session_state.current_page = max(pdf_page_count, 1)
+
+    image_src, page_width, page_height = render_page_as_data_uri(
+        document["pdf_bytes"],
+        st.session_state.current_page,
+        zoom=2.0,
+    )
+except Exception as error:  # pragma: no cover - UI feedback
+    st.error(f"Không render được PDF: {error}", icon=":material/error:")
+    st.stop()
+
+with st.sidebar:
+    visible_labels = render_document_controls(pdf_page_count)
+
+show_document_summary(pdf_page_count)
+
+viewer_col, editor_col = st.columns([5, 2], vertical_alignment="top")
+
+with viewer_col:
+    with st.container(border=True):
+        st.subheader(f"Trang {st.session_state.current_page}")
+        st.caption(
+            "Mẹo: ở chế độ chỉnh sửa, kéo bbox để di chuyển và kéo chấm tròn ở góc để resize. Ở chế độ tạo mới, kéo chuột trên trang để tạo bbox.",
+        )
+        color_map = get_label_colors()
+        viewer_result = bbox_viewer(
+            image_src=image_src,
+            page_width=page_width,
+            page_height=page_height,
+            boxes=get_viewer_elements(st.session_state.current_page, visible_labels),
+            mode=st.session_state.mode,
+            selected_id=st.session_state.selected_element_id,
+            colors=color_map,
+            pending_box=st.session_state.draft_bbox if st.session_state.mode == "create" else None,
+            key=f"bbox-viewer-{document['doc_id']}-{st.session_state.current_page}",
+        )
+        handle_viewer_events(viewer_result, page_width, page_height)
+
+        with st.expander("Màu label", expanded=False, icon=":material/palette:"):
+            for label in get_label_choices():
+                color = color_map[label]
+                st.markdown(
+                    f"<span style='display:inline-block;width:12px;height:12px;border-radius:999px;background:{color};margin-right:8px;'></span>{label}",
+                    unsafe_allow_html=True,
+                )
+
+with editor_col:
+    with st.container(border=True):
+        render_bbox_list_panel()
+
+    st.space("small")
+
+    with st.container(border=True):
+        if st.session_state.mode == "edit":
+            render_edit_panel(page_width, page_height)
+        else:
+            render_create_panel(page_width, page_height)
