@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import streamlit as st
@@ -57,6 +59,12 @@ st.set_page_config(
 )
 
 init_app_state()
+
+
+
+def make_widget_state_suffix(payload: object) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:10]
 
 
 
@@ -171,36 +179,6 @@ def render_document_controls(pdf_page_count: int) -> None:
         set_current_page(int(chosen_page))
         st.rerun()
 
-    st.caption("Zoom thao tác ở viewer và giữ nguyên tọa độ bbox trong JSON.")
-    zoom_col1, zoom_col2, zoom_col3, zoom_col4 = st.columns([1, 1.2, 1, 1])
-    with zoom_col1:
-        if st.button("-", key="zoom-out", use_container_width=True, disabled=get_viewer_zoom() <= 1.0):
-            zoom_out_viewer()
-            st.rerun()
-    with zoom_col2:
-        st.metric("Zoom", f"{int(get_viewer_zoom() * 100)}%")
-    with zoom_col3:
-        if st.button("+", key="zoom-in", use_container_width=True, disabled=get_viewer_zoom() >= 3.0):
-            zoom_in_viewer()
-            st.rerun()
-    with zoom_col4:
-        if st.button("Fit", key="zoom-reset", use_container_width=True):
-            reset_viewer_zoom()
-            st.rerun()
-
-    st.caption("Undo/redo chỉ lưu các thay đổi bbox đã commit, không lưu thao tác pan/zoom.")
-    history_col1, history_col2 = st.columns(2)
-    with history_col1:
-        if st.button("Undo", icon=":material/undo:", use_container_width=True, disabled=not can_undo()):
-            if undo_last_action():
-                set_flash("success", "Đã hoàn tác thao tác gần nhất.")
-            st.rerun()
-    with history_col2:
-        if st.button("Redo", icon=":material/redo:", use_container_width=True, disabled=not can_redo()):
-            if redo_last_action():
-                set_flash("success", "Đã khôi phục thao tác vừa hoàn tác.")
-            st.rerun()
-
     st.subheader("Lưu kết quả")
     export_bytes = export_annotation_bytes(annotation)
     suggested_name = document["json_name"].removesuffix(".json") + "_edited.json"
@@ -228,6 +206,40 @@ def render_document_controls(pdf_page_count: int) -> None:
     st.caption(f":material/task_alt: Trạng thái: **{status_text}**")
     st.caption(f":material/picture_as_pdf: PDF: `{document['pdf_name']}`")
     st.caption(f":material/data_object: JSON: `{document['json_name']}`")
+
+
+
+def render_editor_toolbar() -> None:
+    st.subheader("Thao tác nhanh")
+    st.caption("Zoom và undo/redo được đưa sang panel phải để thao tác gần vùng chỉnh sửa hơn.")
+
+    zoom_col1, zoom_col2, zoom_col3, zoom_col4 = st.columns([1, 1.2, 1, 1])
+    with zoom_col1:
+        if st.button("-", key="zoom-out", use_container_width=True, disabled=get_viewer_zoom() <= 1.0):
+            zoom_out_viewer()
+            st.rerun()
+    with zoom_col2:
+        st.metric("Zoom", f"{int(get_viewer_zoom() * 100)}%")
+    with zoom_col3:
+        if st.button("+", key="zoom-in", use_container_width=True, disabled=get_viewer_zoom() >= 3.0):
+            zoom_in_viewer()
+            st.rerun()
+    with zoom_col4:
+        if st.button("Fit", key="zoom-reset", use_container_width=True):
+            reset_viewer_zoom()
+            st.rerun()
+
+    history_col1, history_col2 = st.columns(2)
+    with history_col1:
+        if st.button("Undo", icon=":material/undo:", use_container_width=True, disabled=not can_undo()):
+            if undo_last_action():
+                set_flash("success", "Đã hoàn tác thao tác gần nhất.")
+            st.rerun()
+    with history_col2:
+        if st.button("Redo", icon=":material/redo:", use_container_width=True, disabled=not can_redo()):
+            if redo_last_action():
+                set_flash("success", "Đã khôi phục thao tác vừa hoàn tác.")
+            st.rerun()
 
 
 
@@ -305,28 +317,101 @@ def render_edit_panel(page_width: float, page_height: float) -> None:
     selected_id, element, page_number, _ = selected
     bbox = [float(value) for value in element.get("bbox", [0, 0, 0, 0])]
     label_options = ", ".join(get_label_choices())
+    element_text = str(element.get("text", ""))
+    element_figure_path = str(element.get("figure_path", ""))
+    text_preview = element_text.replace("\n", " ").strip()
+    text_preview = text_preview[:140] + ("…" if len(text_preview) > 140 else "")
+    form_suffix = make_widget_state_suffix(
+        {
+            "selected_id": selected_id,
+            "label": str(element.get("label", "text")),
+            "bbox": bbox,
+            "text_hash": hashlib.sha1(element_text.encode("utf-8")).hexdigest()[:10],
+            "reading_order": int(element.get("reading_order", 0)),
+            "figure_path": element_figure_path,
+        }
+    )
 
     st.caption(f"Trang {page_number} · ID {selected_id}")
     st.caption(f"Label hiện có: {label_options}")
+    st.caption(f"Reading order hiện tại: {int(element.get('reading_order', 0))}")
+    if text_preview:
+        st.caption(f"Preview text: {text_preview}")
+    if element_figure_path:
+        st.caption(f"Figure path: {element_figure_path}")
+
+    show_extended_fields = st.toggle(
+        "Hiện trường mở rộng (text + metadata)",
+        value=False,
+        key=f"edit-advanced-toggle-{selected_id}",
+        help="Mặc định chỉ load các trường cần sửa nhanh để panel bên phải nhẹ và đỡ lag hơn.",
+    )
 
     with st.form(f"edit-form-{selected_id}"):
-        label = st.text_input("Tên label", value=str(element.get("label", "text")))
+        label = st.text_input(
+            "Tên label",
+            value=str(element.get("label", "text")),
+            key=f"edit-label-{form_suffix}",
+        )
 
         coord_col1, coord_col2 = st.columns(2)
         with coord_col1:
-            x0 = st.number_input("x0", min_value=0.0, max_value=float(page_width), value=bbox[0], step=1.0)
-            y0 = st.number_input("y0", min_value=0.0, max_value=float(page_height), value=bbox[1], step=1.0)
+            x0 = st.number_input(
+                "x0",
+                min_value=0.0,
+                max_value=float(page_width),
+                value=bbox[0],
+                step=1.0,
+                key=f"edit-x0-{form_suffix}",
+            )
+            y0 = st.number_input(
+                "y0",
+                min_value=0.0,
+                max_value=float(page_height),
+                value=bbox[1],
+                step=1.0,
+                key=f"edit-y0-{form_suffix}",
+            )
         with coord_col2:
-            x1 = st.number_input("x1", min_value=0.0, max_value=float(page_width), value=bbox[2], step=1.0)
-            y1 = st.number_input("y1", min_value=0.0, max_value=float(page_height), value=bbox[3], step=1.0)
+            x1 = st.number_input(
+                "x1",
+                min_value=0.0,
+                max_value=float(page_width),
+                value=bbox[2],
+                step=1.0,
+                key=f"edit-x1-{form_suffix}",
+            )
+            y1 = st.number_input(
+                "y1",
+                min_value=0.0,
+                max_value=float(page_height),
+                value=bbox[3],
+                step=1.0,
+                key=f"edit-y1-{form_suffix}",
+            )
 
-        text = st.text_area("Text", value=str(element.get("text", "")), height=180)
-        reading_order = st.number_input(
-            "Reading order",
-            value=int(element.get("reading_order", 0)),
-            step=1,
-        )
-        figure_path = st.text_input("Figure path (optional)", value=str(element.get("figure_path", "")))
+        if show_extended_fields:
+            text = st.text_area(
+                "Text",
+                value=element_text,
+                height=180,
+                key=f"edit-text-{form_suffix}",
+            )
+            reading_order = st.number_input(
+                "Reading order",
+                value=int(element.get("reading_order", 0)),
+                step=1,
+                key=f"edit-reading-order-{form_suffix}",
+            )
+            figure_path = st.text_input(
+                "Figure path (optional)",
+                value=element_figure_path,
+                key=f"edit-figure-path-{form_suffix}",
+            )
+        else:
+            text = element_text
+            reading_order = int(element.get("reading_order", 0))
+            figure_path = element_figure_path
 
         action_col1, action_col2 = st.columns(2)
         with action_col1:
@@ -457,7 +542,7 @@ with viewer_col:
     with st.container(border=True):
         st.subheader(f"Trang {st.session_state.current_page}")
         st.caption(
-            "Mẹo: dùng nút zoom ở sidebar. Khi zoom lớn, cuộn để pan hoặc giữ Space rồi kéo. Ở edit mode có thể kéo bbox để move và kéo chấm góc để resize.",
+            "Mẹo: dùng nút zoom ở panel phải. Khi zoom lớn, cuộn để pan hoặc giữ Space rồi kéo. Ở edit mode có thể kéo bbox để move và kéo chấm góc để resize.",
         )
         color_map = get_label_colors()
         viewer_result = bbox_viewer(
@@ -475,6 +560,11 @@ with viewer_col:
         handle_viewer_events(viewer_result, page_width, page_height)
 
 with editor_col:
+    with st.container(border=True):
+        render_editor_toolbar()
+
+    st.space("small")
+
     with st.container(border=True):
         if st.session_state.mode == "edit":
             render_edit_panel(page_width, page_height)
