@@ -728,7 +728,7 @@ def render_loaded_document(editor_state: dict[str, Any]) -> None:
     stroke_color = label_lookup(editor_state.get("labels")).get(new_box_label, {}).get("color", "#2563eb")
 
     original_image = render_page_image(editor_state["pdf_source"], page.page_number, float(editor_state["zoom"]))
-    image = fit_canvas_image(original_image)
+    image = fit_canvas_image(original_image).convert("RGB")
     geometry = build_page_geometry(page, image.width, image.height)
     canvas_boxes = build_canvas_boxes(page, geometry, editor_state.get("labels"))
 
@@ -750,7 +750,7 @@ def render_loaded_document(editor_state: dict[str, Any]) -> None:
     canvas_col, details_col = st.columns([3.0, 1.2], gap="medium")
 
     with canvas_col:
-        canvas_result = stable_st_canvas(
+        canvas_result = drawable_canvas_module.st_canvas(
             fill_color=rgba_from_hex(stroke_color, 0.08),
             stroke_width=2,
             stroke_color=stroke_color,
@@ -779,8 +779,8 @@ def render_loaded_document(editor_state: dict[str, Any]) -> None:
             editor_state["selected_element_id"] = inferred_selected_id
 
         st.caption(
-            "Click and interact directly on the PDF canvas. Resize or move a box to update the detail panel on the right; "
-            "drawing a new box will also show its label and bbox there before you apply changes."
+            "Interact directly on the PDF canvas. Moving, resizing, or drawing a box updates the panel on the right; "
+            "the selector in that panel is kept as a reliable fallback for choosing an existing box."
         )
         if st.button("Apply canvas changes", type="primary", width="stretch"):
             apply_canvas_changes(active_canvas_json, canvas_boxes, new_box_label, image.width, image.height)
@@ -789,15 +789,33 @@ def render_loaded_document(editor_state: dict[str, Any]) -> None:
         st.subheader("Boxes on this page")
         st.dataframe(build_elements_dataframe(editor_state), hide_index=True, width="stretch")
 
+    payload_by_id = {str(box.get("id") or ""): box for box in canvas_payload if str(box.get("id") or "")}
+    selected_id_options = [""] + [element.id for element in page.elements]
+    current_selected_id = editor_state.get("selected_element_id") or ""
+    if current_selected_id not in selected_id_options:
+        current_selected_id = ""
+
     live_selected_box = select_live_canvas_box(editor_state, canvas_payload, canvas_boxes)
+    if live_selected_box is None and current_selected_id:
+        live_selected_box = payload_by_id.get(current_selected_id)
 
     with details_col:
         st.markdown('<div class="fixinglabel-sticky-panel"><div class="fixinglabel-panel-scroll">', unsafe_allow_html=True)
         detail_panel = st.container(border=True)
         with detail_panel:
             st.subheader("Selected box")
+            selected_id = st.selectbox(
+                "Selected existing box",
+                options=selected_id_options,
+                index=selected_id_options.index(current_selected_id),
+                format_func=lambda value: "No selection" if not value else box_option_label(page, editor_state.get("labels"), value),
+            )
+            editor_state["selected_element_id"] = selected_id
+            if live_selected_box is None and selected_id:
+                live_selected_box = payload_by_id.get(selected_id)
+
             if live_selected_box is None:
-                st.info("Click, move, resize, or draw a box on the PDF to inspect it here.")
+                st.info("Select a box from the list or move/draw one on the PDF to inspect it here.")
             else:
                 live_label_id = str(live_selected_box.get("label") or new_box_label)
                 live_label_name = label_display_name(editor_state.get("labels"), live_label_id)
