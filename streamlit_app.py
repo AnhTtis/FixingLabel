@@ -9,6 +9,27 @@ import sys
 import pandas as pd
 import streamlit as st
 from PIL import Image
+
+
+def ensure_streamlit_drawable_canvas_compat() -> None:
+    """Patch Streamlit internals expected by streamlit-drawable-canvas on newer Streamlit builds."""
+    try:
+        import streamlit.elements.image as st_image
+        if hasattr(st_image, "image_to_url"):
+            return
+        from streamlit.elements.lib.image_utils import image_to_url as raw_image_to_url
+        from streamlit.elements.lib.layout_utils import create_layout_config
+    except Exception:
+        return
+
+    def _compat_image_to_url(image, width, clamp, channels, output_format, image_id):
+        layout_config = create_layout_config(width=width, allow_content_width=True)
+        return raw_image_to_url(image, layout_config, clamp, channels, output_format, image_id)
+
+    st_image.image_to_url = _compat_image_to_url
+
+
+ensure_streamlit_drawable_canvas_compat()
 from streamlit_drawable_canvas import st_canvas
 
 PROJECT_ROOT = Path(__file__).resolve().parent
