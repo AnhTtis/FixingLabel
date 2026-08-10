@@ -24,19 +24,32 @@ CSS = """
 }
 
 .viewer-stage {
-  position: relative;
-  width: 100%;
-  overflow: hidden;
   border: 1px solid var(--st-border-color, #d6ddf0);
   border-radius: 1rem;
   background: var(--st-secondary-background-color, #eef3ff);
   box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+  overflow: hidden;
+}
+
+.viewer-viewport {
+  width: 100%;
+  height: clamp(560px, 78vh, 980px);
+  overflow: auto;
+  position: relative;
+  overscroll-behavior: contain;
+}
+
+.viewer-canvas {
+  position: relative;
+  margin: 0 auto;
 }
 
 .viewer-image {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
   user-select: none;
   -webkit-user-drag: none;
 }
@@ -232,6 +245,47 @@ function buildResizeBox(startBox, handle, point, pageWidth, pageHeight) {
   return normalizeBox([x0, y0, x1, y1]);
 }
 
+function isTypingTarget(target) {
+  if (!target || typeof target.closest !== 'function') {
+    return false;
+  }
+  return Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
+}
+
+function applyCanvasSize(root, viewport, canvas, image, svg, zoom, pageWidth, pageHeight) {
+  const baseWidth = Math.max(viewport.clientWidth - 2, 320);
+  const aspectRatio = pageHeight / pageWidth;
+  const nextWidth = baseWidth * zoom;
+  const nextHeight = nextWidth * aspectRatio;
+
+  const previousWidth = root.__canvasWidth || nextWidth;
+  const previousHeight = root.__canvasHeight || nextHeight;
+  const previousScrollLeft = viewport.scrollLeft;
+  const previousScrollTop = viewport.scrollTop;
+  const centerRatioX = previousWidth > 0 ? (previousScrollLeft + viewport.clientWidth / 2) / previousWidth : 0.5;
+  const centerRatioY = previousHeight > 0 ? (previousScrollTop + viewport.clientHeight / 2) / previousHeight : 0.5;
+
+  canvas.style.width = `${nextWidth}px`;
+  canvas.style.height = `${nextHeight}px`;
+  image.style.width = `${nextWidth}px`;
+  image.style.height = `${nextHeight}px`;
+  svg.style.width = `${nextWidth}px`;
+  svg.style.height = `${nextHeight}px`;
+
+  root.__canvasWidth = nextWidth;
+  root.__canvasHeight = nextHeight;
+
+  const shouldRecenter = root.__lastZoom !== zoom || Math.abs(previousWidth - nextWidth) > 1;
+  if (shouldRecenter) {
+    requestAnimationFrame(() => {
+      viewport.scrollLeft = clamp(centerRatioX * nextWidth - viewport.clientWidth / 2, 0, Math.max(nextWidth - viewport.clientWidth, 0));
+      viewport.scrollTop = clamp(centerRatioY * nextHeight - viewport.clientHeight / 2, 0, Math.max(nextHeight - viewport.clientHeight, 0));
+    });
+  }
+
+  root.__lastZoom = zoom;
+}
+
 export default function(component) {
   const { data, parentElement, setTriggerValue } = component;
   const root = parentElement.querySelector('.bbox-viewer');
@@ -243,20 +297,56 @@ export default function(component) {
     root.innerHTML = `
       <div class="viewer-shell">
         <div class="viewer-stage">
-          <img class="viewer-image" alt="PDF page preview" draggable="false" />
-          <svg class="viewer-overlay" preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="viewer-viewport">
+            <div class="viewer-canvas">
+              <img class="viewer-image" alt="PDF page preview" draggable="false" />
+              <svg class="viewer-overlay" preserveAspectRatio="xMidYMid meet"></svg>
+            </div>
+          </div>
         </div>
         <div class="viewer-hint"></div>
       </div>
     `;
+
+    root.__spacePressed = false;
+    root.__suppressNextClick = false;
+
+    root.__keyDownHandler = (event) => {
+      if (event.code !== 'Space' || isTypingTarget(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      root.__spacePressed = true;
+      const viewportNode = root.querySelector('.viewer-viewport');
+      if (viewportNode && !root.__moveHandler) {
+        viewportNode.style.cursor = 'grab';
+      }
+    };
+
+    root.__keyUpHandler = (event) => {
+      if (event.code === 'Space') {
+        root.__spacePressed = false;
+        const viewportNode = root.querySelector('.viewer-viewport');
+        if (viewportNode && !root.__moveHandler) {
+          viewportNode.style.cursor = 'default';
+        }
+      }
+    };
+
+    window.addEventListener('keydown', root.__keyDownHandler);
+    window.addEventListener('keyup', root.__keyUpHandler);
     root.__mounted = true;
   }
 
+  const viewport = root.querySelector('.viewer-viewport');
+  const canvas = root.querySelector('.viewer-canvas');
   const image = root.querySelector('.viewer-image');
   const svg = root.querySelector('.viewer-overlay');
   const hint = root.querySelector('.viewer-hint');
+
   const pageWidth = Number(data?.pageWidth || 1);
   const pageHeight = Number(data?.pageHeight || 1);
+  const zoom = Number(data?.zoom || 1);
   const mode = data?.mode || 'edit';
   const boxes = Array.isArray(data?.boxes) ? data.boxes : [];
   const selectedId = data?.selectedId || null;
@@ -265,6 +355,22 @@ export default function(component) {
 
   image.src = data?.imageSrc || '';
   svg.setAttribute('viewBox', `0 0 ${pageWidth} ${pageHeight}`);
+
+  root.__latestMetrics = {
+    zoom,
+    pageWidth,
+    pageHeight,
+  };
+
+  if (!root.__resizeObserver) {
+    root.__resizeObserver = new ResizeObserver(() => {
+      const latest = root.__latestMetrics || { zoom, pageWidth, pageHeight };
+      applyCanvasSize(root, viewport, canvas, image, svg, latest.zoom, latest.pageWidth, latest.pageHeight);
+    });
+    root.__resizeObserver.observe(viewport);
+  }
+
+  applyCanvasSize(root, viewport, canvas, image, svg, zoom, pageWidth, pageHeight);
   svg.innerHTML = '';
 
   const resetWindowHandlers = () => {
@@ -279,6 +385,42 @@ export default function(component) {
   };
 
   resetWindowHandlers();
+
+  const startPanInteraction = (event) => {
+    event.preventDefault();
+    root.__suppressNextClick = true;
+
+    const startLeft = viewport.scrollLeft;
+    const startTop = viewport.scrollTop;
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let moved = false;
+
+    viewport.style.cursor = 'grabbing';
+
+    const handleMove = (moveEvent) => {
+      const dx = moveEvent.clientX - startX;
+      const dy = moveEvent.clientY - startY;
+      if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+        moved = true;
+      }
+      viewport.scrollLeft = startLeft - dx;
+      viewport.scrollTop = startTop - dy;
+    };
+
+    const handleUp = () => {
+      viewport.style.cursor = root.__spacePressed ? 'grab' : 'default';
+      resetWindowHandlers();
+      if (!moved) {
+        root.__suppressNextClick = false;
+      }
+    };
+
+    root.__moveHandler = handleMove;
+    root.__upHandler = handleUp;
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp, { once: true });
+  };
 
   const background = makeSvgNode('rect', {
     x: 0,
@@ -314,11 +456,22 @@ export default function(component) {
     svg.appendChild(draftRect);
   }
 
+  viewport.style.cursor = root.__spacePressed ? 'grab' : 'default';
+
   if (mode === 'edit') {
-    hint.textContent = 'Click để chọn bbox. Kéo khung để di chuyển hoặc kéo các nút tròn ở góc để resize trực tiếp.';
-    background.style.cursor = 'default';
+    hint.textContent = 'Click để chọn bbox. Kéo khung để di chuyển, kéo chấm góc để resize. Giữ Space và kéo để pan khi đang zoom.';
     background.addEventListener('click', () => {
+      if (root.__suppressNextClick) {
+        root.__suppressNextClick = false;
+        return;
+      }
       setTriggerValue('selected', '__clear__');
+    });
+
+    background.addEventListener('pointerdown', (event) => {
+      if (root.__spacePressed) {
+        startPanInteraction(event);
+      }
     });
 
     if (selectedBox && selectedRect) {
@@ -381,9 +534,13 @@ export default function(component) {
       });
     }
   } else {
-    hint.textContent = 'Kéo chuột trên trang để tạo bbox mới. Sau đó điền label và thông tin chi tiết ở panel bên phải.';
-    background.style.cursor = 'crosshair';
+    hint.textContent = 'Kéo chuột để tạo bbox mới. Giữ Space và kéo để pan khi đang zoom.';
     background.addEventListener('pointerdown', (event) => {
+      if (root.__spacePressed) {
+        startPanInteraction(event);
+        return;
+      }
+
       const start = toPagePoint(event, svg, pageWidth, pageHeight);
       const draftRect = makeSvgNode('rect', {
         x: start.x,
@@ -425,6 +582,19 @@ export default function(component) {
 
   return () => {
     resetWindowHandlers();
+    if (root.__resizeObserver) {
+      root.__resizeObserver.disconnect();
+      root.__resizeObserver = null;
+    }
+    if (root.__keyDownHandler) {
+      window.removeEventListener('keydown', root.__keyDownHandler);
+      root.__keyDownHandler = null;
+    }
+    if (root.__keyUpHandler) {
+      window.removeEventListener('keyup', root.__keyUpHandler);
+      root.__keyUpHandler = null;
+    }
+    root.__mounted = false;
   };
 }
 """
@@ -448,6 +618,7 @@ def bbox_viewer(
     selected_id: str | None,
     colors: dict[str, str],
     pending_box: list[float] | None,
+    zoom: float,
     key: str,
 ) -> dict[str, Any]:
     result = _VIEWER_COMPONENT(
@@ -461,6 +632,7 @@ def bbox_viewer(
             "selectedId": selected_id,
             "colors": colors,
             "pendingBox": pending_box,
+            "zoom": zoom,
         },
         on_selected_change=lambda: None,
         on_draft_bbox_change=lambda: None,

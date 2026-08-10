@@ -15,6 +15,8 @@ from labeling_app.io import (
 from labeling_app.pdf_render import get_pdf_page_count, render_page_as_data_uri
 from labeling_app.state import (
     add_element,
+    can_redo,
+    can_undo,
     clear_draft_bbox,
     clear_selection,
     delete_selected_element,
@@ -26,19 +28,25 @@ from labeling_app.state import (
     get_page_elements,
     get_selected_element,
     get_viewer_elements,
+    get_viewer_zoom,
     init_app_state,
     load_document,
     make_element_id,
     mark_clean,
     next_reading_order,
     pop_flash,
+    redo_last_action,
+    reset_viewer_zoom,
     select_element,
     set_current_page,
     set_draft_bbox,
     set_flash,
     set_mode,
+    undo_last_action,
     update_element_bbox,
     update_selected_element,
+    zoom_in_viewer,
+    zoom_out_viewer,
 )
 
 st.set_page_config(
@@ -66,24 +74,6 @@ def show_flash_message() -> None:
         st.warning(message, icon=":material/warning:")
     else:
         st.info(message, icon=":material/info:")
-
-
-
-def sync_visible_labels() -> list[str]:
-    labels = get_label_choices()
-    current = list(st.session_state.get("visible_labels", []))
-    normalized = [label for label in current if label in labels]
-
-    if not normalized and labels:
-        normalized = labels.copy()
-
-    new_labels = [label for label in labels if label not in normalized]
-    merged = normalized + new_labels
-
-    if merged != current:
-        st.session_state.visible_labels = merged
-
-    return labels
 
 
 
@@ -141,11 +131,11 @@ def render_upload_loader() -> None:
 
 
 
-def render_document_controls(pdf_page_count: int) -> list[str]:
+def render_document_controls(pdf_page_count: int) -> None:
     document = get_document()
     annotation = get_annotation()
     if document is None or annotation is None:
-        return []
+        return
 
     annotation["total_pages"] = max(int(annotation.get("total_pages") or 0), pdf_page_count)
     st.subheader("Điều khiển")
@@ -181,13 +171,35 @@ def render_document_controls(pdf_page_count: int) -> list[str]:
         set_current_page(int(chosen_page))
         st.rerun()
 
-    labels = sync_visible_labels()
-    visible_labels = st.multiselect(
-        "Label hiển thị",
-        options=labels,
-        key="visible_labels",
-        help="Ẩn hoặc hiện bbox theo từng loại label.",
-    )
+    st.caption("Zoom thao tác ở viewer và giữ nguyên tọa độ bbox trong JSON.")
+    zoom_col1, zoom_col2, zoom_col3, zoom_col4 = st.columns([1, 1.2, 1, 1])
+    with zoom_col1:
+        if st.button("-", key="zoom-out", use_container_width=True, disabled=get_viewer_zoom() <= 1.0):
+            zoom_out_viewer()
+            st.rerun()
+    with zoom_col2:
+        st.metric("Zoom", f"{int(get_viewer_zoom() * 100)}%")
+    with zoom_col3:
+        if st.button("+", key="zoom-in", use_container_width=True, disabled=get_viewer_zoom() >= 3.0):
+            zoom_in_viewer()
+            st.rerun()
+    with zoom_col4:
+        if st.button("Fit", key="zoom-reset", use_container_width=True):
+            reset_viewer_zoom()
+            st.rerun()
+
+    st.caption("Undo/redo chỉ lưu các thay đổi bbox đã commit, không lưu thao tác pan/zoom.")
+    history_col1, history_col2 = st.columns(2)
+    with history_col1:
+        if st.button("Undo", icon=":material/undo:", use_container_width=True, disabled=not can_undo()):
+            if undo_last_action():
+                set_flash("success", "Đã hoàn tác thao tác gần nhất.")
+            st.rerun()
+    with history_col2:
+        if st.button("Redo", icon=":material/redo:", use_container_width=True, disabled=not can_redo()):
+            if redo_last_action():
+                set_flash("success", "Đã khôi phục thao tác vừa hoàn tác.")
+            st.rerun()
 
     st.subheader("Lưu kết quả")
     export_bytes = export_annotation_bytes(annotation)
@@ -217,8 +229,6 @@ def render_document_controls(pdf_page_count: int) -> list[str]:
     st.caption(f":material/picture_as_pdf: PDF: `{document['pdf_name']}`")
     st.caption(f":material/data_object: JSON: `{document['json_name']}`")
 
-    return visible_labels
-
 
 
 def show_document_summary(pdf_page_count: int) -> None:
@@ -235,7 +245,7 @@ def show_document_summary(pdf_page_count: int) -> None:
     with header_col:
         st.title("PDF label studio")
         st.caption(
-            "Hiển thị trực tiếp trang PDF, click để chọn bbox, kéo thả để di chuyển/resize, và cập nhật JSON ngay trong app.",
+            "Hiển thị trực tiếp trang PDF, zoom/pan mượt trong viewer, kéo để move/resize bbox và cập nhật JSON ngay trong app.",
         )
     with badge_col:
         mode_label = "Chỉnh label" if st.session_state.mode == "edit" else "Tạo label mới"
@@ -452,7 +462,7 @@ def render_create_panel(page_width: float, page_height: float) -> None:
 
 with st.sidebar:
     st.title("PDF label studio")
-    st.caption("Chuẩn bị sẵn cho việc deploy Streamlit: sample local, upload file, chỉnh trực tiếp và export JSON.")
+    st.caption("Load PDF + JSON, zoom/pan ngay trong viewer và chỉnh bbox theo page-space để sẵn sàng deploy Streamlit.")
     render_local_loader()
     st.space("small")
     render_upload_loader()
@@ -476,14 +486,14 @@ try:
     image_src, page_width, page_height = render_page_as_data_uri(
         document["pdf_bytes"],
         st.session_state.current_page,
-        zoom=2.0,
+        render_scale=3.0,
     )
 except Exception as error:  # pragma: no cover - UI feedback
     st.error(f"Không render được PDF: {error}", icon=":material/error:")
     st.stop()
 
 with st.sidebar:
-    visible_labels = render_document_controls(pdf_page_count)
+    render_document_controls(pdf_page_count)
 
 show_document_summary(pdf_page_count)
 
@@ -493,29 +503,22 @@ with viewer_col:
     with st.container(border=True):
         st.subheader(f"Trang {st.session_state.current_page}")
         st.caption(
-            "Mẹo: ở chế độ chỉnh sửa, kéo bbox để di chuyển và kéo chấm tròn ở góc để resize. Ở chế độ tạo mới, kéo chuột trên trang để tạo bbox.",
+            "Mẹo: dùng nút zoom ở sidebar. Khi zoom lớn, cuộn để pan hoặc giữ Space rồi kéo. Ở edit mode có thể kéo bbox để move và kéo chấm góc để resize.",
         )
         color_map = get_label_colors()
         viewer_result = bbox_viewer(
             image_src=image_src,
             page_width=page_width,
             page_height=page_height,
-            boxes=get_viewer_elements(st.session_state.current_page, visible_labels),
+            boxes=get_viewer_elements(st.session_state.current_page),
             mode=st.session_state.mode,
             selected_id=st.session_state.selected_element_id,
             colors=color_map,
             pending_box=st.session_state.draft_bbox if st.session_state.mode == "create" else None,
+            zoom=get_viewer_zoom(),
             key=f"bbox-viewer-{document['doc_id']}-{st.session_state.current_page}",
         )
         handle_viewer_events(viewer_result, page_width, page_height)
-
-        with st.expander("Màu label", expanded=False, icon=":material/palette:"):
-            for label in get_label_choices():
-                color = color_map[label]
-                st.markdown(
-                    f"<span style='display:inline-block;width:12px;height:12px;border-radius:999px;background:{color};margin-right:8px;'></span>{label}",
-                    unsafe_allow_html=True,
-                )
 
 with editor_col:
     with st.container(border=True):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 from typing import Any
 
@@ -33,6 +34,11 @@ FALLBACK_COLORS = [
     "#c2410c",
 ]
 
+HISTORY_LIMIT = 100
+MIN_VIEWER_ZOOM = 1.0
+MAX_VIEWER_ZOOM = 3.0
+VIEWER_ZOOM_STEP = 0.25
+
 
 
 def init_app_state() -> None:
@@ -42,7 +48,9 @@ def init_app_state() -> None:
     st.session_state.setdefault("selected_element_id", None)
     st.session_state.setdefault("draft_bbox", None)
     st.session_state.setdefault("flash", None)
-    st.session_state.setdefault("visible_labels", [])
+    st.session_state.setdefault("viewer_zoom", 1.0)
+    st.session_state.setdefault("undo_stack", [])
+    st.session_state.setdefault("redo_stack", [])
 
 
 
@@ -67,7 +75,9 @@ def load_document(document: dict[str, Any]) -> None:
     st.session_state.mode = "edit"
     st.session_state.selected_element_id = None
     st.session_state.draft_bbox = None
-    st.session_state.visible_labels = get_label_choices()
+    st.session_state.viewer_zoom = 1.0
+    st.session_state.undo_stack = []
+    st.session_state.redo_stack = []
 
 
 
@@ -107,6 +117,31 @@ def get_page_count() -> int:
         return 0
     pages = annotation.setdefault("pages", [])
     return max(int(annotation.get("total_pages") or len(pages)), len(pages))
+
+
+
+def get_viewer_zoom() -> float:
+    return float(st.session_state.get("viewer_zoom", 1.0))
+
+
+
+def set_viewer_zoom(value: float) -> None:
+    st.session_state.viewer_zoom = max(MIN_VIEWER_ZOOM, min(float(value), MAX_VIEWER_ZOOM))
+
+
+
+def zoom_in_viewer() -> None:
+    set_viewer_zoom(get_viewer_zoom() + VIEWER_ZOOM_STEP)
+
+
+
+def zoom_out_viewer() -> None:
+    set_viewer_zoom(get_viewer_zoom() - VIEWER_ZOOM_STEP)
+
+
+
+def reset_viewer_zoom() -> None:
+    set_viewer_zoom(1.0)
 
 
 
@@ -167,20 +202,15 @@ def get_page_elements(page_number: int) -> list[dict[str, Any]]:
 
 
 
-def get_viewer_elements(page_number: int, visible_labels: list[str] | None = None) -> list[dict[str, Any]]:
-    visible = set(visible_labels or [])
+def get_viewer_elements(page_number: int) -> list[dict[str, Any]]:
     boxes: list[dict[str, Any]] = []
 
     for element_index, element in enumerate(get_page_elements(page_number)):
-        label = str(element.get("label", "text"))
-        if visible and label not in visible:
-            continue
-
         text_preview = str(element.get("text", "")).replace("\n", " ")[:120]
         boxes.append(
             {
                 "id": make_element_id(page_number, element_index),
-                "label": label,
+                "label": str(element.get("label", "text")),
                 "bbox": [float(value) for value in element.get("bbox", [0, 0, 0, 0])],
                 "text": text_preview,
             }
@@ -235,10 +265,19 @@ def delete_selected_element() -> None:
     if selected is None:
         return
 
-    _, _, page_number, element_index = selected
+    selected_id, _, page_number, element_index = selected
+    before_elements = snapshot_page_elements(page_number)
     elements = get_page_elements(page_number)
     elements.pop(element_index)
     clear_selection()
+    after_elements = snapshot_page_elements(page_number)
+    _push_history_entry(
+        page_number=page_number,
+        before_elements=before_elements,
+        after_elements=after_elements,
+        selected_before=selected_id,
+        selected_after=None,
+    )
     mark_dirty()
 
 
@@ -257,6 +296,116 @@ def normalize_bbox(bbox: list[float], page_width: float, page_height: float) -> 
 
 
 
+def snapshot_page_elements(page_number: int) -> list[dict[str, Any]]:
+    return copy.deepcopy(get_page_elements(page_number))
+
+
+
+def _set_page_elements(page_number: int, elements: list[dict[str, Any]]) -> None:
+    page = get_page_entry(page_number, create=True)
+    if page is None:
+        raise ValueError("Page could not be created.")
+    page["elements"] = copy.deepcopy(elements)
+
+
+
+def _push_history_entry(
+    *,
+    page_number: int,
+    before_elements: list[dict[str, Any]],
+    after_elements: list[dict[str, Any]],
+    selected_before: str | None,
+    selected_after: str | None,
+) -> None:
+    if before_elements == after_elements:
+        return
+
+    entry = {
+        "page_number": int(page_number),
+        "before_elements": copy.deepcopy(before_elements),
+        "after_elements": copy.deepcopy(after_elements),
+        "selected_before": selected_before,
+        "selected_after": selected_after,
+    }
+
+    undo_stack = list(st.session_state.get("undo_stack", []))
+    undo_stack.append(entry)
+    if len(undo_stack) > HISTORY_LIMIT:
+        undo_stack = undo_stack[-HISTORY_LIMIT:]
+
+    st.session_state.undo_stack = undo_stack
+    st.session_state.redo_stack = []
+
+
+
+def can_undo() -> bool:
+    return bool(st.session_state.get("undo_stack"))
+
+
+
+def can_redo() -> bool:
+    return bool(st.session_state.get("redo_stack"))
+
+
+
+def _restore_selection(selected_id: str | None) -> None:
+    if not selected_id:
+        clear_selection()
+        return
+
+    page_number, element_index = parse_element_id(selected_id)
+    elements = get_page_elements(page_number)
+    if 0 <= element_index < len(elements):
+        st.session_state.selected_element_id = selected_id
+    else:
+        clear_selection()
+
+
+
+def undo_last_action() -> bool:
+    undo_stack = list(st.session_state.get("undo_stack", []))
+    if not undo_stack:
+        return False
+
+    entry = undo_stack.pop()
+    st.session_state.undo_stack = undo_stack
+
+    _set_page_elements(entry["page_number"], entry["before_elements"])
+    st.session_state.current_page = int(entry["page_number"])
+    st.session_state.mode = "edit"
+    clear_draft_bbox()
+    _restore_selection(entry.get("selected_before"))
+
+    redo_stack = list(st.session_state.get("redo_stack", []))
+    redo_stack.append(entry)
+    st.session_state.redo_stack = redo_stack[-HISTORY_LIMIT:]
+    mark_dirty()
+    return True
+
+
+
+def redo_last_action() -> bool:
+    redo_stack = list(st.session_state.get("redo_stack", []))
+    if not redo_stack:
+        return False
+
+    entry = redo_stack.pop()
+    st.session_state.redo_stack = redo_stack
+
+    _set_page_elements(entry["page_number"], entry["after_elements"])
+    st.session_state.current_page = int(entry["page_number"])
+    st.session_state.mode = "edit"
+    clear_draft_bbox()
+    _restore_selection(entry.get("selected_after"))
+
+    undo_stack = list(st.session_state.get("undo_stack", []))
+    undo_stack.append(entry)
+    st.session_state.undo_stack = undo_stack[-HISTORY_LIMIT:]
+    mark_dirty()
+    return True
+
+
+
 def update_element_bbox(
     element_id: str,
     bbox: list[float],
@@ -268,8 +417,20 @@ def update_element_bbox(
     if not (0 <= element_index < len(elements)):
         return
 
+    before_elements = snapshot_page_elements(page_number)
+    selected_before = st.session_state.get("selected_element_id")
+
     elements[element_index]["bbox"] = normalize_bbox(bbox, page_width, page_height)
     st.session_state.selected_element_id = element_id
+
+    after_elements = snapshot_page_elements(page_number)
+    _push_history_entry(
+        page_number=page_number,
+        before_elements=before_elements,
+        after_elements=after_elements,
+        selected_before=selected_before,
+        selected_after=element_id,
+    )
     mark_dirty()
 
 
@@ -288,7 +449,10 @@ def update_selected_element(
     if selected is None:
         return
 
-    _, element, _, _ = selected
+    selected_id, element, page_number, _ = selected
+    before_elements = snapshot_page_elements(page_number)
+    selected_before = st.session_state.get("selected_element_id")
+
     element["label"] = label.strip() or "text"
     element["bbox"] = normalize_bbox(bbox, page_width, page_height)
     element["text"] = text
@@ -300,6 +464,14 @@ def update_selected_element(
     else:
         element.pop("figure_path", None)
 
+    after_elements = snapshot_page_elements(page_number)
+    _push_history_entry(
+        page_number=page_number,
+        before_elements=before_elements,
+        after_elements=after_elements,
+        selected_before=selected_before,
+        selected_after=selected_id,
+    )
     mark_dirty()
 
 
@@ -323,6 +495,9 @@ def add_element(
     page_width: float,
     page_height: float,
 ) -> str:
+    before_elements = snapshot_page_elements(page_number)
+    selected_before = st.session_state.get("selected_element_id")
+
     page = get_page_entry(page_number, create=True)
     if page is None:
         raise ValueError("Page could not be created.")
@@ -340,7 +515,15 @@ def add_element(
 
     page.setdefault("elements", []).append(element)
     element_id = make_element_id(page_number, len(page["elements"]) - 1)
+    after_elements = snapshot_page_elements(page_number)
 
+    _push_history_entry(
+        page_number=page_number,
+        before_elements=before_elements,
+        after_elements=after_elements,
+        selected_before=selected_before,
+        selected_after=element_id,
+    )
     mark_dirty()
     return element_id
 
