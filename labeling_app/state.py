@@ -55,6 +55,21 @@ def init_app_state() -> None:
 
 
 
+def unload_document() -> None:
+    st.session_state.document = None
+    st.session_state.current_page = 1
+    st.session_state.mode = "edit"
+    st.session_state.selected_element_id = None
+    st.session_state.draft_bbox = None
+    st.session_state.viewer_zoom = 1.0
+    st.session_state.undo_stack = []
+    st.session_state.redo_stack = []
+    st.session_state.annotation_revision = 0
+    st.session_state["_derived_cache_state"] = {}
+    st.session_state["_annotation_export_cache"] = {}
+
+
+
 def set_flash(kind: str, message: str) -> None:
     st.session_state.flash = {"kind": kind, "message": message}
 

@@ -14,7 +14,7 @@ from labeling_app.io import (
     load_local_document,
     save_annotation,
 )
-from labeling_app.pdf_render import get_pdf_page_count, render_page_as_data_uri
+from labeling_app.pdf_render import clear_pdf_render_cache, get_pdf_page_count, render_page_as_data_uri
 from labeling_app.state import (
     add_element,
     can_redo,
@@ -46,6 +46,7 @@ from labeling_app.state import (
     set_flash,
     set_mode,
     undo_last_action,
+    unload_document,
     update_element_bbox,
     update_selected_element,
     zoom_in_viewer,
@@ -97,13 +98,30 @@ def get_cached_export_bytes() -> bytes:
     if document is None or annotation is None:
         return b""
 
+    export_space = ((document.get("coord_meta") or {}).get("default_export_space") or "scaled_896_xyxy")
     cache = st.session_state.setdefault("_annotation_export_cache", {})
-    cache_key = (document["doc_id"], get_annotation_revision())
+    cache_key = (document["doc_id"], get_annotation_revision(), export_space)
     if cache.get("key") != cache_key:
         cache["key"] = cache_key
-        cache["value"] = export_annotation_bytes(annotation)
+        cache["value"] = export_annotation_bytes(document, export_space=export_space)
 
     return cache["value"]
+
+
+
+def release_current_document_resources(*, clear_document: bool) -> None:
+    clear_pdf_render_cache()
+    st.session_state["_annotation_export_cache"] = {}
+    st.session_state["_derived_cache_state"] = {}
+
+    for state_key in list(st.session_state.keys()):
+        if isinstance(state_key, str) and state_key.startswith("bbox-viewer-"):
+            st.session_state.pop(state_key, None)
+
+    if clear_document:
+        st.session_state.pop("uploaded_pdf", None)
+        st.session_state.pop("uploaded_json", None)
+        unload_document()
 
 
 
@@ -169,6 +187,7 @@ def render_local_loader() -> None:
             set_flash("warning", f"Không load được sample local: {error}")
             st.rerun()
 
+        release_current_document_resources(clear_document=True)
         load_document(document)
         set_flash("success", f"Đã load {Path(pair['json_path']).name}.")
         st.rerun()
@@ -193,6 +212,7 @@ def render_upload_loader() -> None:
             set_flash("warning", f"Không đọc được file upload: {error}")
             st.rerun()
 
+        release_current_document_resources(clear_document=True)
         load_document(document)
         set_flash("success", f"Đã load {uploaded_json.name} và {uploaded_pdf.name}.")
         st.rerun()
@@ -205,7 +225,6 @@ def render_document_controls(pdf_page_count: int) -> None:
     if document is None or annotation is None:
         return
 
-    annotation["total_pages"] = max(int(annotation.get("total_pages") or 0), pdf_page_count)
     st.subheader("Điều khiển")
 
     mode = st.segmented_control(
@@ -250,17 +269,23 @@ def render_document_controls(pdf_page_count: int) -> None:
         use_container_width=True,
         icon=":material/download:",
     )
+    st.caption(":material/swap_horiz: File xuất ra dùng bbox 896 xyxy theo đúng scale max-dim 896 của dataset.")
 
     if document.get("json_path"):
         if st.button("Ghi đè file JSON hiện tại", use_container_width=True, icon=":material/save:"):
             try:
-                save_annotation(annotation, Path(document["json_path"]))
+                save_annotation(document, Path(document["json_path"]))
             except Exception as error:  # pragma: no cover - UI feedback
                 set_flash("warning", f"Không lưu được file JSON: {error}")
             else:
                 mark_clean()
                 set_flash("success", f"Đã lưu vào {document['json_path']}.")
             st.rerun()
+
+    if st.button("Đóng file và giải phóng RAM", use_container_width=True, icon=":material/close:"):
+        release_current_document_resources(clear_document=True)
+        set_flash("success", "Đã đóng file hiện tại và dọn cache/render state khỏi RAM.")
+        st.rerun()
 
     status_text = "Có thay đổi chưa lưu" if document.get("dirty") else "Đã đồng bộ"
     st.caption(f":material/task_alt: Trạng thái: **{status_text}**")
