@@ -23,18 +23,17 @@ from labeling_app.state import (
     clear_selection,
     delete_selected_element,
     get_annotation,
-    get_annotation_revision,
     get_document,
     get_label_choices,
     get_label_colors,
     get_page_count,
     get_page_elements,
     get_selected_element,
-    get_total_element_count,
     get_viewer_elements,
     get_viewer_zoom,
     init_app_state,
     load_document,
+    make_element_id,
     mark_clean,
     next_reading_order,
     pop_flash,
@@ -83,65 +82,6 @@ def show_flash_message() -> None:
         st.warning(message, icon=":material/warning:")
     else:
         st.info(message, icon=":material/info:")
-
-
-
-def get_viewer_component_key(document: dict[str, object]) -> str:
-    return f"bbox-viewer-{document['doc_id']}-{st.session_state.current_page}"
-
-
-
-def get_cached_export_bytes() -> bytes:
-    document = get_document()
-    annotation = get_annotation()
-    if document is None or annotation is None:
-        return b""
-
-    cache = st.session_state.setdefault("_annotation_export_cache", {})
-    cache_key = (document["doc_id"], get_annotation_revision())
-    if cache.get("key") != cache_key:
-        cache["key"] = cache_key
-        cache["value"] = export_annotation_bytes(annotation)
-
-    return cache["value"]
-
-
-
-def _read_component_field(component_key: str, field_name: str) -> object:
-    component_state = st.session_state.get(component_key)
-    if component_state is None:
-        return None
-    if isinstance(component_state, dict):
-        return component_state.get(field_name)
-    return getattr(component_state, field_name, None)
-
-
-
-def apply_pending_viewer_events(component_key: str, page_width: float, page_height: float) -> None:
-    selected = _read_component_field(component_key, "selected")
-    if isinstance(selected, str):
-        if selected == "__clear__":
-            clear_selection()
-        else:
-            select_element(selected)
-
-    draft_payload = _read_component_field(component_key, "draft_bbox")
-    if isinstance(draft_payload, dict):
-        bbox = draft_payload.get("bbox")
-        if isinstance(bbox, list) and len(bbox) == 4:
-            set_draft_bbox([float(value) for value in bbox])
-
-    bbox_changed = _read_component_field(component_key, "bbox_changed")
-    if isinstance(bbox_changed, dict):
-        element_id = bbox_changed.get("id")
-        bbox = bbox_changed.get("bbox")
-        if isinstance(element_id, str) and isinstance(bbox, list) and len(bbox) == 4:
-            update_element_bbox(
-                element_id,
-                [float(value) for value in bbox],
-                page_width,
-                page_height,
-            )
 
 
 
@@ -240,7 +180,7 @@ def render_document_controls(pdf_page_count: int) -> None:
         st.rerun()
 
     st.subheader("Lưu kết quả")
-    export_bytes = get_cached_export_bytes()
+    export_bytes = export_annotation_bytes(annotation)
     suggested_name = document["json_name"].removesuffix(".json") + "_edited.json"
     st.download_button(
         "Tải JSON đã chỉnh",
@@ -270,31 +210,35 @@ def render_document_controls(pdf_page_count: int) -> None:
 
 
 def render_editor_toolbar() -> None:
-    st.caption("Thao tác nhanh: undo/redo và zoom gần vùng chỉnh sửa để thao tác đỡ phải kéo chuột xa.")
+    st.subheader("Thao tác nhanh")
+    st.caption("Zoom và undo/redo được đưa sang panel phải để thao tác gần vùng chỉnh sửa hơn.")
 
-    with st.container(horizontal=True, horizontal_alignment="left", vertical_alignment="center"):
-        if st.button("Undo", key="toolbar-undo", icon=":material/undo:", disabled=not can_undo()):
+    zoom_col1, zoom_col2, zoom_col3, zoom_col4 = st.columns([1, 1.2, 1, 1])
+    with zoom_col1:
+        if st.button("-", key="zoom-out", use_container_width=True, disabled=get_viewer_zoom() <= 1.0):
+            zoom_out_viewer()
+            st.rerun()
+    with zoom_col2:
+        st.metric("Zoom", f"{int(get_viewer_zoom() * 100)}%")
+    with zoom_col3:
+        if st.button("+", key="zoom-in", use_container_width=True, disabled=get_viewer_zoom() >= 3.0):
+            zoom_in_viewer()
+            st.rerun()
+    with zoom_col4:
+        if st.button("Fit", key="zoom-reset", use_container_width=True):
+            reset_viewer_zoom()
+            st.rerun()
+
+    history_col1, history_col2 = st.columns(2)
+    with history_col1:
+        if st.button("Undo", icon=":material/undo:", use_container_width=True, disabled=not can_undo()):
             if undo_last_action():
                 set_flash("success", "Đã hoàn tác thao tác gần nhất.")
             st.rerun()
-
-        if st.button("Redo", key="toolbar-redo", icon=":material/redo:", disabled=not can_redo()):
+    with history_col2:
+        if st.button("Redo", icon=":material/redo:", use_container_width=True, disabled=not can_redo()):
             if redo_last_action():
                 set_flash("success", "Đã khôi phục thao tác vừa hoàn tác.")
-            st.rerun()
-
-        st.markdown(f"**{int(get_viewer_zoom() * 100)}%**")
-
-        if st.button("-", key="zoom-out", disabled=get_viewer_zoom() <= 1.0, help="Thu nhỏ viewer"):
-            zoom_out_viewer()
-            st.rerun()
-
-        if st.button("+", key="zoom-in", disabled=get_viewer_zoom() >= 3.0, help="Phóng to viewer"):
-            zoom_in_viewer()
-            st.rerun()
-
-        if st.button("Fit", key="zoom-reset", help="Đưa zoom về 100%"):
-            reset_viewer_zoom()
             st.rerun()
 
 
@@ -305,7 +249,7 @@ def show_document_summary(pdf_page_count: int) -> None:
     if document is None or annotation is None:
         return
 
-    total_elements = get_total_element_count()
+    total_elements = sum(len(page.get("elements", [])) for page in annotation.get("pages", []))
     annotation_page_count = get_page_count()
     current_elements = len(get_page_elements(st.session_state.current_page))
 
@@ -331,6 +275,34 @@ def show_document_summary(pdf_page_count: int) -> None:
             "Số trang trong JSON khác với PDF. App vẫn render theo PDF và giữ nguyên cấu trúc JSON khi lưu.",
             icon=":material/warning:",
         )
+
+
+
+def handle_viewer_events(viewer_result: dict[str, object], page_width: float, page_height: float) -> None:
+    selected = viewer_result.get("selected")
+    if isinstance(selected, str):
+        if selected == "__clear__":
+            clear_selection()
+        else:
+            select_element(selected)
+
+    draft_payload = viewer_result.get("draft_bbox")
+    if isinstance(draft_payload, dict):
+        bbox = draft_payload.get("bbox")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            set_draft_bbox([float(value) for value in bbox])
+
+    bbox_changed = viewer_result.get("bbox_changed")
+    if isinstance(bbox_changed, dict):
+        element_id = bbox_changed.get("id")
+        bbox = bbox_changed.get("bbox")
+        if isinstance(element_id, str) and isinstance(bbox, list) and len(bbox) == 4:
+            update_element_bbox(
+                element_id,
+                [float(value) for value in bbox],
+                page_width,
+                page_height,
+            )
 
 
 
@@ -559,9 +531,6 @@ except Exception as error:  # pragma: no cover - UI feedback
     st.error(f"Không render được PDF: {error}", icon=":material/error:")
     st.stop()
 
-viewer_component_key = get_viewer_component_key(document)
-apply_pending_viewer_events(viewer_component_key, page_width, page_height)
-
 with st.sidebar:
     render_document_controls(pdf_page_count)
 
@@ -576,7 +545,7 @@ with viewer_col:
             "Mẹo: dùng nút zoom ở panel phải. Khi zoom lớn, cuộn để pan hoặc giữ Space rồi kéo. Ở edit mode có thể kéo bbox để move và kéo chấm góc để resize.",
         )
         color_map = get_label_colors()
-        bbox_viewer(
+        viewer_result = bbox_viewer(
             image_src=image_src,
             page_width=page_width,
             page_height=page_height,
@@ -586,8 +555,9 @@ with viewer_col:
             colors=color_map,
             pending_box=st.session_state.draft_bbox if st.session_state.mode == "create" else None,
             zoom=get_viewer_zoom(),
-            key=viewer_component_key,
+            key=f"bbox-viewer-{document['doc_id']}-{st.session_state.current_page}",
         )
+        handle_viewer_events(viewer_result, page_width, page_height)
 
 with editor_col:
     with st.container(border=True):
