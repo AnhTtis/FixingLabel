@@ -51,6 +51,7 @@ def init_app_state() -> None:
     st.session_state.setdefault("viewer_zoom", 1.0)
     st.session_state.setdefault("undo_stack", [])
     st.session_state.setdefault("redo_stack", [])
+    st.session_state.setdefault("annotation_revision", 0)
 
 
 
@@ -78,6 +79,9 @@ def load_document(document: dict[str, Any]) -> None:
     st.session_state.viewer_zoom = 1.0
     st.session_state.undo_stack = []
     st.session_state.redo_stack = []
+    st.session_state.annotation_revision = 0
+    st.session_state["_derived_cache_state"] = {}
+    st.session_state["_annotation_export_cache"] = {}
 
 
 
@@ -117,6 +121,30 @@ def get_page_count() -> int:
         return 0
     pages = annotation.setdefault("pages", [])
     return max(int(annotation.get("total_pages") or len(pages)), len(pages))
+
+
+
+def get_annotation_revision() -> int:
+    return int(st.session_state.get("annotation_revision", 0))
+
+
+
+def _bump_annotation_revision() -> None:
+    st.session_state.annotation_revision = get_annotation_revision() + 1
+
+
+
+def _get_revision_cache() -> dict[object, Any]:
+    document = get_document()
+    cache_state = st.session_state.setdefault("_derived_cache_state", {})
+    cache_key = ((document or {}).get("doc_id"), get_annotation_revision())
+
+    if cache_state.get("key") != cache_key:
+        cache_state.clear()
+        cache_state["key"] = cache_key
+        cache_state["values"] = {}
+
+    return cache_state["values"]
 
 
 
@@ -203,8 +231,13 @@ def get_page_elements(page_number: int) -> list[dict[str, Any]]:
 
 
 def get_viewer_elements(page_number: int) -> list[dict[str, Any]]:
-    boxes: list[dict[str, Any]] = []
+    cache = _get_revision_cache()
+    cache_key = ("viewer_elements", int(page_number))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
 
+    boxes: list[dict[str, Any]] = []
     for element_index, element in enumerate(get_page_elements(page_number)):
         text_preview = str(element.get("text", "")).replace("\n", " ")[:120]
         boxes.append(
@@ -216,6 +249,7 @@ def get_viewer_elements(page_number: int) -> list[dict[str, Any]]:
             }
         )
 
+    cache[cache_key] = boxes
     return boxes
 
 
@@ -267,10 +301,12 @@ def delete_selected_element() -> None:
 
     selected_id, _, page_number, element_index = selected
     before_elements = snapshot_page_elements(page_number)
+    after_elements = copy.deepcopy(before_elements)
+    after_elements.pop(element_index)
+
     elements = get_page_elements(page_number)
     elements.pop(element_index)
     clear_selection()
-    after_elements = snapshot_page_elements(page_number)
     _push_history_entry(
         page_number=page_number,
         before_elements=before_elements,
@@ -278,6 +314,7 @@ def delete_selected_element() -> None:
         selected_before=selected_id,
         selected_after=None,
     )
+    _bump_annotation_revision()
     mark_dirty()
 
 
@@ -321,9 +358,42 @@ def _push_history_entry(
         return
 
     entry = {
+        "kind": "page_snapshot",
         "page_number": int(page_number),
-        "before_elements": copy.deepcopy(before_elements),
-        "after_elements": copy.deepcopy(after_elements),
+        "before_elements": before_elements,
+        "after_elements": after_elements,
+        "selected_before": selected_before,
+        "selected_after": selected_after,
+    }
+
+    undo_stack = list(st.session_state.get("undo_stack", []))
+    undo_stack.append(entry)
+    if len(undo_stack) > HISTORY_LIMIT:
+        undo_stack = undo_stack[-HISTORY_LIMIT:]
+
+    st.session_state.undo_stack = undo_stack
+    st.session_state.redo_stack = []
+
+
+
+def _push_bbox_history_entry(
+    *,
+    page_number: int,
+    element_index: int,
+    before_bbox: list[float],
+    after_bbox: list[float],
+    selected_before: str | None,
+    selected_after: str | None,
+) -> None:
+    if before_bbox == after_bbox:
+        return
+
+    entry = {
+        "kind": "bbox_update",
+        "page_number": int(page_number),
+        "element_index": int(element_index),
+        "before_bbox": list(before_bbox),
+        "after_bbox": list(after_bbox),
         "selected_before": selected_before,
         "selected_after": selected_after,
     }
@@ -362,15 +432,32 @@ def _restore_selection(selected_id: str | None) -> None:
 
 
 
+def _apply_bbox_history_entry(entry: dict[str, Any], bbox_field: str) -> bool:
+    page_number = int(entry["page_number"])
+    element_index = int(entry["element_index"])
+    elements = get_page_elements(page_number)
+    if not (0 <= element_index < len(elements)):
+        return False
+
+    elements[element_index]["bbox"] = [float(value) for value in entry[bbox_field]]
+    return True
+
+
+
 def undo_last_action() -> bool:
     undo_stack = list(st.session_state.get("undo_stack", []))
     if not undo_stack:
         return False
 
     entry = undo_stack.pop()
-    st.session_state.undo_stack = undo_stack
 
-    _set_page_elements(entry["page_number"], entry["before_elements"])
+    if entry.get("kind") == "bbox_update":
+        if not _apply_bbox_history_entry(entry, "before_bbox"):
+            return False
+    else:
+        _set_page_elements(entry["page_number"], entry["before_elements"])
+
+    st.session_state.undo_stack = undo_stack
     st.session_state.current_page = int(entry["page_number"])
     st.session_state.mode = "edit"
     clear_draft_bbox()
@@ -379,6 +466,7 @@ def undo_last_action() -> bool:
     redo_stack = list(st.session_state.get("redo_stack", []))
     redo_stack.append(entry)
     st.session_state.redo_stack = redo_stack[-HISTORY_LIMIT:]
+    _bump_annotation_revision()
     mark_dirty()
     return True
 
@@ -390,9 +478,14 @@ def redo_last_action() -> bool:
         return False
 
     entry = redo_stack.pop()
-    st.session_state.redo_stack = redo_stack
 
-    _set_page_elements(entry["page_number"], entry["after_elements"])
+    if entry.get("kind") == "bbox_update":
+        if not _apply_bbox_history_entry(entry, "after_bbox"):
+            return False
+    else:
+        _set_page_elements(entry["page_number"], entry["after_elements"])
+
+    st.session_state.redo_stack = redo_stack
     st.session_state.current_page = int(entry["page_number"])
     st.session_state.mode = "edit"
     clear_draft_bbox()
@@ -401,6 +494,7 @@ def redo_last_action() -> bool:
     undo_stack = list(st.session_state.get("undo_stack", []))
     undo_stack.append(entry)
     st.session_state.undo_stack = undo_stack[-HISTORY_LIMIT:]
+    _bump_annotation_revision()
     mark_dirty()
     return True
 
@@ -417,20 +511,25 @@ def update_element_bbox(
     if not (0 <= element_index < len(elements)):
         return
 
-    before_elements = snapshot_page_elements(page_number)
-    selected_before = st.session_state.get("selected_element_id")
+    normalized_bbox = normalize_bbox(bbox, page_width, page_height)
+    current_bbox = normalize_bbox(elements[element_index].get("bbox", [0, 0, 0, 0]), page_width, page_height)
+    if current_bbox == normalized_bbox:
+        st.session_state.selected_element_id = element_id
+        return
 
-    elements[element_index]["bbox"] = normalize_bbox(bbox, page_width, page_height)
+    selected_before = st.session_state.get("selected_element_id")
+    elements[element_index]["bbox"] = normalized_bbox
     st.session_state.selected_element_id = element_id
 
-    after_elements = snapshot_page_elements(page_number)
-    _push_history_entry(
+    _push_bbox_history_entry(
         page_number=page_number,
-        before_elements=before_elements,
-        after_elements=after_elements,
+        element_index=element_index,
+        before_bbox=current_bbox,
+        after_bbox=normalized_bbox,
         selected_before=selected_before,
         selected_after=element_id,
     )
+    _bump_annotation_revision()
     mark_dirty()
 
 
@@ -449,22 +548,32 @@ def update_selected_element(
     if selected is None:
         return
 
-    selected_id, element, page_number, _ = selected
+    selected_id, element, page_number, element_index = selected
     before_elements = snapshot_page_elements(page_number)
     selected_before = st.session_state.get("selected_element_id")
 
-    element["label"] = label.strip() or "text"
-    element["bbox"] = normalize_bbox(bbox, page_width, page_height)
-    element["text"] = text
-    element["reading_order"] = int(reading_order)
+    updated_element = copy.deepcopy(before_elements[element_index])
+    updated_element["label"] = label.strip() or "text"
+    updated_element["bbox"] = normalize_bbox(bbox, page_width, page_height)
+    updated_element["text"] = text
+    updated_element["reading_order"] = int(reading_order)
 
     cleaned_figure_path = figure_path.strip()
     if cleaned_figure_path:
-        element["figure_path"] = cleaned_figure_path
+        updated_element["figure_path"] = cleaned_figure_path
     else:
-        element.pop("figure_path", None)
+        updated_element.pop("figure_path", None)
 
-    after_elements = snapshot_page_elements(page_number)
+    if before_elements[element_index] == updated_element:
+        st.session_state.selected_element_id = selected_id
+        return
+
+    after_elements = copy.deepcopy(before_elements)
+    after_elements[element_index] = updated_element
+
+    element.clear()
+    element.update(copy.deepcopy(updated_element))
+
     _push_history_entry(
         page_number=page_number,
         before_elements=before_elements,
@@ -472,6 +581,7 @@ def update_selected_element(
         selected_before=selected_before,
         selected_after=selected_id,
     )
+    _bump_annotation_revision()
     mark_dirty()
 
 
@@ -515,7 +625,8 @@ def add_element(
 
     page.setdefault("elements", []).append(element)
     element_id = make_element_id(page_number, len(page["elements"]) - 1)
-    after_elements = snapshot_page_elements(page_number)
+    after_elements = copy.deepcopy(before_elements)
+    after_elements.append(copy.deepcopy(element))
 
     _push_history_entry(
         page_number=page_number,
@@ -524,29 +635,55 @@ def add_element(
         selected_before=selected_before,
         selected_after=element_id,
     )
+    _bump_annotation_revision()
     mark_dirty()
     return element_id
 
 
 
 def get_label_choices() -> list[str]:
+    cache = _get_revision_cache()
+    cached = cache.get("label_choices")
+    if cached is not None:
+        return cached
+
     labels = set(DEFAULT_LABELS)
     for page in get_pages():
         for element in page.get("elements", []):
             label = str(element.get("label", "")).strip()
             if label:
                 labels.add(label)
-    return sorted(labels)
+
+    choices = sorted(labels)
+    cache["label_choices"] = choices
+    return choices
 
 
 
 def get_label_colors() -> dict[str, str]:
-    colors = dict(BASE_LABEL_COLORS)
+    cache = _get_revision_cache()
+    cached = cache.get("label_colors")
+    if cached is not None:
+        return cached
 
+    colors = dict(BASE_LABEL_COLORS)
     for label in get_label_choices():
         if label in colors:
             continue
         digest = hashlib.sha256(label.encode("utf-8")).digest()[0]
         colors[label] = FALLBACK_COLORS[digest % len(FALLBACK_COLORS)]
 
+    cache["label_colors"] = colors
     return colors
+
+
+
+def get_total_element_count() -> int:
+    cache = _get_revision_cache()
+    cached = cache.get("total_element_count")
+    if cached is not None:
+        return cached
+
+    total = sum(len(page.get("elements", [])) for page in get_pages())
+    cache["total_element_count"] = total
+    return total
