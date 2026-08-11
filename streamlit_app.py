@@ -124,6 +124,10 @@ def release_current_document_resources(*, clear_document: bool) -> None:
         unload_document()
 
 
+if st.session_state.pop("_pending_document_unload", False):
+    release_current_document_resources(clear_document=True)
+
+
 
 def _read_component_field(component_key: str, field_name: str) -> object:
     component_state = st.session_state.get(component_key)
@@ -283,7 +287,7 @@ def render_document_controls(pdf_page_count: int) -> None:
             st.rerun()
 
     if st.button("Đóng file và giải phóng RAM", use_container_width=True, icon=":material/close:"):
-        release_current_document_resources(clear_document=True)
+        st.session_state["_pending_document_unload"] = True
         set_flash("success", "Đã đóng file hiện tại và dọn cache/render state khỏi RAM.")
         st.rerun()
 
